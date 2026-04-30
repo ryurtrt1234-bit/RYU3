@@ -4,15 +4,16 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 
 // ── Canvas dimensions ────────────────────────────────────────
 const SW = 820;   // simulation canvas width
-const SH = 480;   // simulation canvas height
+const SH = 520;   // simulation canvas height
 const CW = 820;   // chart canvas width
 const CH = 110;   // chart canvas height
 
-// ── Belt ellipse ─────────────────────────────────────────────
-const BX = 395, BY = 215;   // center
-const BRX = 305, BRY = 155; // semi-axes
-const BELT_W = 26;          // track width in px
-const WORKER_OFFSET = 62;   // px outward from belt for worker icon
+// ── Belt rectangle ───────────────────────────────────────────
+const BCX = 410, BCY = 230;  // center
+const BW = 620, BH = 280;    // width, height
+const BR = 80;               // corner radius
+const BELT_W = 26;           // track width in px
+const WORKER_OFFSET = 45;    // px outward from belt for worker icon
 
 // ── Bag sizing ───────────────────────────────────────────────
 const BAG_W = 14, BAG_H = 10;
@@ -26,18 +27,18 @@ const BAG_PALETTE = [
 // ── Types ────────────────────────────────────────────────────
 interface Bag {
   id: number;
-  pos: number;          // 0-1 belt position
+  pos: number;
   color: string;
-  circuits: number;     // full loops completed
-  rejects: number;      // times denied by a worker
+  circuits: number;
+  rejects: number;
   state: 'belt' | 'queued' | 'floor';
   workerId: number | null;
 }
 
 interface WorkerDef {
   id: number;
-  pos: number;          // 0-1 belt position
-  speed: number;        // bags/second
+  pos: number;
+  speed: number;
   maxQueue: number;
   queue: Bag[];
   current: Bag | null;
@@ -66,32 +67,93 @@ interface SimState {
   lastHist: number;
 }
 
-// ── Geometry helpers ─────────────────────────────────────────
-function beltPt(t: number): [number, number] {
-  const a = t * Math.PI * 2 - Math.PI / 2;
-  return [BX + BRX * Math.cos(a), BY + BRY * Math.sin(a)];
+// ── Rounded-rectangle belt geometry ─────────────────────────
+// t=0 is at the top-center; traversal is clockwise.
+function beltInfo(t: number): { pt: [number, number]; normal: [number, number]; tangent: [number, number] } {
+  const W_IN = BW - 2 * BR;
+  const H_IN = BH - 2 * BR;
+  const CORNER = (Math.PI / 2) * BR;
+  const PERIM = 2 * W_IN + 2 * H_IN + 4 * CORNER;
+
+  let d = (((t % 1) + 1) % 1) * PERIM;
+
+  // Top straight – right half (center → right)
+  if (d < W_IN / 2) {
+    return { pt: [BCX + d, BCY - BH / 2], normal: [0, -1], tangent: [1, 0] };
+  }
+  d -= W_IN / 2;
+
+  // Top-right corner (angle: −π/2 → 0)
+  if (d < CORNER) {
+    const a = -Math.PI / 2 + (d / CORNER) * (Math.PI / 2);
+    const c = Math.cos(a), s = Math.sin(a);
+    return { pt: [BCX + W_IN / 2 + BR * c, BCY - H_IN / 2 + BR * s], normal: [c, s], tangent: [-s, c] };
+  }
+  d -= CORNER;
+
+  // Right straight (top → bottom)
+  if (d < H_IN) {
+    return { pt: [BCX + BW / 2, BCY - H_IN / 2 + d], normal: [1, 0], tangent: [0, 1] };
+  }
+  d -= H_IN;
+
+  // Bottom-right corner (angle: 0 → π/2)
+  if (d < CORNER) {
+    const a = (d / CORNER) * (Math.PI / 2);
+    const c = Math.cos(a), s = Math.sin(a);
+    return { pt: [BCX + W_IN / 2 + BR * c, BCY + H_IN / 2 + BR * s], normal: [c, s], tangent: [-s, c] };
+  }
+  d -= CORNER;
+
+  // Bottom straight (right → left)
+  if (d < W_IN) {
+    return { pt: [BCX + W_IN / 2 - d, BCY + BH / 2], normal: [0, 1], tangent: [-1, 0] };
+  }
+  d -= W_IN;
+
+  // Bottom-left corner (angle: π/2 → π)
+  if (d < CORNER) {
+    const a = Math.PI / 2 + (d / CORNER) * (Math.PI / 2);
+    const c = Math.cos(a), s = Math.sin(a);
+    return { pt: [BCX - W_IN / 2 + BR * c, BCY + H_IN / 2 + BR * s], normal: [c, s], tangent: [-s, c] };
+  }
+  d -= CORNER;
+
+  // Left straight (bottom → top)
+  if (d < H_IN) {
+    return { pt: [BCX - BW / 2, BCY + H_IN / 2 - d], normal: [-1, 0], tangent: [0, -1] };
+  }
+  d -= H_IN;
+
+  // Top-left corner (angle: π → 3π/2)
+  if (d < CORNER) {
+    const a = Math.PI + (d / CORNER) * (Math.PI / 2);
+    const c = Math.cos(a), s = Math.sin(a);
+    return { pt: [BCX - W_IN / 2 + BR * c, BCY - H_IN / 2 + BR * s], normal: [c, s], tangent: [-s, c] };
+  }
+  d -= CORNER;
+
+  // Top straight – left half (left → center)
+  return { pt: [BCX - W_IN / 2 + d, BCY - BH / 2], normal: [0, -1], tangent: [1, 0] };
 }
 
-function beltNormal(t: number): [number, number] {
-  const a = t * Math.PI * 2 - Math.PI / 2;
-  // Outward normal for ellipse: (cos(a)/BRX, sin(a)/BRY) normalized
-  const nx = Math.cos(a) / BRX;
-  const ny = Math.sin(a) / BRY;
-  const len = Math.sqrt(nx * nx + ny * ny);
-  return [nx / len, ny / len];
-}
-
-function beltTangent(t: number): [number, number] {
-  const a = t * Math.PI * 2 - Math.PI / 2;
-  const tx = -BRX * Math.sin(a);
-  const ty =  BRY * Math.cos(a);
-  const len = Math.sqrt(tx * tx + ty * ty);
-  return [tx / len, ty / len];
+// ── Draw a rounded-rectangle path ────────────────────────────
+function roundRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
 }
 
 function workerXY(w: WorkerDef): [number, number] {
-  const [bx, by] = beltPt(w.pos);
-  const [nx, ny] = beltNormal(w.pos);
+  const { pt: [bx, by], normal: [nx, ny] } = beltInfo(w.pos);
   return [bx + nx * WORKER_OFFSET, by + ny * WORKER_OFFSET];
 }
 
@@ -100,7 +162,7 @@ function makeState(workerPositions: number[], workerSpeeds: number[], maxQ: numb
   const workers: WorkerDef[] = workerPositions.map((pos, i) => ({
     id: i,
     pos,
-    speed: workerSpeeds[i],
+    speed: 1 / workerSpeeds[i],
     maxQueue: maxQ,
     queue: [],
     current: null,
@@ -122,15 +184,9 @@ function makeState(workerPositions: number[], workerSpeeds: number[], maxQ: numb
 }
 
 // ── Simulation step ──────────────────────────────────────────
-function step(
-  s: SimState,
-  dt: number,
-  arrivalRate: number,  // bags/sec
-  beltSpeed: number,    // circuits/sec
-) {
+function step(s: SimState, dt: number, arrivalRate: number, beltSpeed: number) {
   s.time += dt;
 
-  // Spawn bags
   while (s.time >= s.nextSpawn) {
     s.bags.push({
       id: s.nextId++,
@@ -144,55 +200,44 @@ function step(
     s.nextSpawn += (1 / arrivalRate) * (0.6 + Math.random() * 0.8);
   }
 
-  // Move belt bags & check worker claims
   for (const bag of s.bags) {
     if (bag.state !== 'belt') continue;
-
     const prevPos = bag.pos;
     bag.pos += beltSpeed * dt;
-    if (bag.pos >= 1.0) {
-      bag.pos -= 1.0;
-      bag.circuits++;
-    }
+    if (bag.pos >= 1.0) { bag.pos -= 1.0; bag.circuits++; }
 
-    // Did the bag pass any worker position?
     for (const w of s.workers) {
+      // 処理中・待機中の荷物があれば受け付けない
+      if (w.current !== null || w.queue.length > 0) continue;
+
       const wPos = w.pos;
       let crossed = false;
       if (prevPos <= bag.pos) {
         crossed = prevPos <= wPos && wPos < bag.pos;
       } else {
-        // wrapped around 0
         crossed = wPos >= prevPos || wPos < bag.pos;
       }
       if (!crossed) continue;
 
-      // Try to claim
-      if (w.queue.length < w.maxQueue) {
-        bag.state = 'queued';
-        bag.workerId = w.id;
-        bag.pos = w.pos;
-        w.queue.push(bag);
-        break;
-      } else {
-        bag.rejects++;
-        // After enough rejects, floor it at the fullest worker near current pos
-        if (bag.rejects >= 3 || bag.circuits >= 3) {
-          bag.state = 'floor';
-          // assign floor to worker with longest queue
-          const busiest = s.workers.reduce((a, b) =>
-            (a.queue.length + (a.current ? 1 : 0)) >= (b.queue.length + (b.current ? 1 : 0)) ? a : b
-          );
-          bag.workerId = busiest.id;
-          busiest.floorBags++;
-          s.totalFloor++;
-          break;
-        }
-      }
+      bag.state = 'queued';
+      bag.workerId = w.id;
+      bag.pos = w.pos;
+      w.queue.push(bag);
+      break;
+    }
+
+    // 3周しても引き取られなかった荷物は地面へ
+    if (bag.state === 'belt' && bag.circuits >= 3) {
+      bag.state = 'floor';
+      const busiest = s.workers.reduce((a, b) =>
+        (a.queue.length + (a.current ? 1 : 0)) >= (b.queue.length + (b.current ? 1 : 0)) ? a : b
+      );
+      bag.workerId = busiest.id;
+      busiest.floorBags++;
+      s.totalFloor++;
     }
   }
 
-  // Worker processing
   for (const w of s.workers) {
     if (!w.current && w.queue.length > 0) {
       w.current = w.queue.shift()!;
@@ -201,7 +246,6 @@ function step(
     if (w.current) {
       w.procTimer -= dt;
       if (w.procTimer <= 0) {
-        // done
         const b = w.current;
         s.bags = s.bags.filter(x => x.id !== b.id);
         w.current = null;
@@ -211,15 +255,12 @@ function step(
     }
   }
 
-  // Record history every second
   if (s.time - s.lastHist >= 1) {
     s.lastHist = s.time;
-    const beltCount = s.bags.filter(b => b.state === 'belt').length;
-    const floorCount = s.bags.filter(b => b.state === 'floor').length;
     s.hist.push({
       t: s.time,
-      belt: beltCount,
-      floor: floorCount,
+      belt: s.bags.filter(b => b.state === 'belt').length,
+      floor: s.bags.filter(b => b.state === 'floor').length,
       done: s.totalDone,
       queues: s.workers.map(w => w.queue.length + (w.current ? 1 : 0)),
     });
@@ -230,44 +271,38 @@ function step(
 // ── Queue color ──────────────────────────────────────────────
 function queueColor(qLen: number, maxQ: number): string {
   const ratio = qLen / maxQ;
-  if (ratio < 0.4) return '#22C55E';   // green
-  if (ratio < 0.7) return '#EAB308';   // yellow
-  return '#EF4444';                     // red
+  if (ratio < 0.4) return '#22C55E';
+  if (ratio < 0.7) return '#EAB308';
+  return '#EF4444';
 }
 
 // ── Draw simulation canvas ───────────────────────────────────
-function drawSim(
-  ctx: CanvasRenderingContext2D,
-  s: SimState,
-  now: number,
-) {
+function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number) {
   const { workers, bags } = s;
 
-  // Background
   ctx.fillStyle = '#111827';
   ctx.fillRect(0, 0, SW, SH);
+
+  const bx = BCX - BW / 2, by = BCY - BH / 2;
 
   // Belt track shadow
   ctx.save();
   ctx.shadowColor = '#000';
   ctx.shadowBlur = 12;
-  ctx.beginPath();
-  ctx.ellipse(BX, BY, BRX, BRY, 0, 0, Math.PI * 2);
+  roundRectPath(ctx, bx, by, BW, BH, BR);
   ctx.strokeStyle = '#1F2937';
   ctx.lineWidth = BELT_W + 8;
   ctx.stroke();
   ctx.restore();
 
   // Belt surface
-  ctx.beginPath();
-  ctx.ellipse(BX, BY, BRX, BRY, 0, 0, Math.PI * 2);
+  roundRectPath(ctx, bx, by, BW, BH, BR);
   ctx.strokeStyle = '#374151';
   ctx.lineWidth = BELT_W;
   ctx.stroke();
 
   // Belt center line (dashed)
-  ctx.beginPath();
-  ctx.ellipse(BX, BY, BRX, BRY, 0, 0, Math.PI * 2);
+  roundRectPath(ctx, bx, by, BW, BH, BR);
   ctx.strokeStyle = '#4B5563';
   ctx.lineWidth = 1.5;
   ctx.setLineDash([6, 8]);
@@ -275,10 +310,8 @@ function drawSim(
   ctx.setLineDash([]);
 
   // Belt arrows (direction indicators)
-  for (let i = 0; i < 8; i++) {
-    const t = i / 8;
-    const [ax, ay] = beltPt(t);
-    const [tx, ty] = beltTangent(t);
+  for (let i = 0; i < 10; i++) {
+    const { pt: [ax, ay], tangent: [tx, ty] } = beltInfo(i / 10);
     ctx.save();
     ctx.translate(ax, ay);
     ctx.rotate(Math.atan2(ty, tx));
@@ -294,7 +327,7 @@ function drawSim(
 
   // Injection point
   {
-    const [ix, iy] = beltPt(0);
+    const { pt: [ix, iy] } = beltInfo(0);
     ctx.save();
     ctx.shadowColor = '#10B981';
     ctx.shadowBlur = 14;
@@ -310,7 +343,7 @@ function drawSim(
     ctx.fillText('荷物投入', ix, iy - 18);
   }
 
-  // Find bottleneck worker
+  // Bottleneck worker
   const bottleneck = workers.reduce((a, b) => {
     const qa = a.queue.length + (a.current ? 1 : 0);
     const qb = b.queue.length + (b.current ? 1 : 0);
@@ -325,7 +358,6 @@ function drawSim(
     const col = queueColor(totalQ, w.maxQueue);
     const isBottleneck = w === bottleneck && bottleneckQueue >= 3;
 
-    // Bottleneck pulse ring
     if (isBottleneck) {
       const pulse = 0.6 + 0.4 * Math.abs(Math.sin(now * 3));
       ctx.save();
@@ -339,8 +371,8 @@ function drawSim(
       ctx.restore();
     }
 
-    // Queue stack (bags stacked outward from belt)
-    const [nx, ny] = beltNormal(w.pos);
+    // Queue stack outward from belt
+    const { normal: [nx, ny] } = beltInfo(w.pos);
     const queueBags = [...w.queue];
     if (w.current) queueBags.unshift(w.current);
     for (let qi = 0; qi < queueBags.length; qi++) {
@@ -376,7 +408,7 @@ function drawSim(
     ctx.shadowColor = col;
     ctx.shadowBlur = 10;
     ctx.beginPath();
-    ctx.arc(wx, wy, 18, 0, Math.PI * 2);
+    ctx.arc(wx, wy, 20, 0, Math.PI * 2);
     ctx.fillStyle = col + '33';
     ctx.fill();
     ctx.strokeStyle = col;
@@ -384,16 +416,14 @@ function drawSim(
     ctx.stroke();
     ctx.restore();
 
-    // Worker label
     ctx.fillStyle = '#F9FAFB';
-    ctx.font = 'bold 12px sans-serif';
+    ctx.font = 'bold 9px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(`W${w.id + 1}`, wx, wy);
+    ctx.fillText(`作業${w.id + 1}`, wx, wy);
 
-    // Queue count badge
     if (totalQ > 0) {
-      const badgeX = wx + 16, badgeY = wy - 16;
+      const badgeX = wx + 18, badgeY = wy - 18;
       ctx.beginPath();
       ctx.arc(badgeX, badgeY, 9, 0, Math.PI * 2);
       ctx.fillStyle = col;
@@ -405,7 +435,6 @@ function drawSim(
       ctx.fillText(String(totalQ), badgeX, badgeY);
     }
 
-    // Floor bags indicator
     if (w.floorBags > 0) {
       const pileCx = wx - nx * 30;
       const pileCy = wy - ny * 30;
@@ -426,31 +455,27 @@ function drawSim(
       ctx.fillText(`地面:${w.floorBags}`, pileCx, pileCy + 12);
     }
 
-    // Bottleneck label
     if (isBottleneck) {
       ctx.save();
       ctx.fillStyle = '#FEF2F2';
       ctx.font = 'bold 11px sans-serif';
       ctx.textAlign = 'center';
-      const bly = wy + 32;
       ctx.shadowColor = '#EF4444';
       ctx.shadowBlur = 8;
-      ctx.fillText('⚠ 渋滞', wx, bly);
+      ctx.fillText('⚠ 渋滞', wx, wy + 32);
       ctx.restore();
     }
   }
 
-  // Draw bags on belt
+  // Bags on belt
   for (const bag of bags) {
     if (bag.state !== 'belt') continue;
-    const [bx2, by2] = beltPt(bag.pos);
-    const [tx, ty] = beltTangent(bag.pos);
+    const { pt: [bx2, by2], tangent: [tx, ty] } = beltInfo(bag.pos);
 
     ctx.save();
     ctx.translate(bx2, by2);
     ctx.rotate(Math.atan2(ty, tx));
 
-    // Stale bags (circulated many times) get a warning tint
     const alpha = bag.circuits === 0 ? 'FF' : bag.circuits === 1 ? 'CC' : '99';
     ctx.fillStyle = bag.color + alpha;
     ctx.strokeStyle = '#fff';
@@ -460,7 +485,6 @@ function drawSim(
     ctx.fillRect(-BAG_W / 2, -BAG_H / 2, BAG_W, BAG_H);
     ctx.strokeRect(-BAG_W / 2, -BAG_H / 2, BAG_W, BAG_H);
 
-    // Circuit count dot for circulating bags
     if (bag.circuits > 0) {
       ctx.fillStyle = bag.circuits >= 3 ? '#EF4444' : '#EAB308';
       ctx.beginPath();
@@ -474,16 +498,17 @@ function drawSim(
   // Stats overlay (top-left)
   ctx.fillStyle = 'rgba(17,24,39,0.85)';
   ctx.beginPath();
-  ctx.roundRect(12, 10, 170, 80, 8);
+  ctx.roundRect(12, 10, 170, 98, 8);
   ctx.fill();
   ctx.fillStyle = '#E5E7EB';
   ctx.font = '11px monospace';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'top';
   ctx.fillText(`時刻:  ${s.time.toFixed(1)} s`, 22, 18);
-  ctx.fillText(`ベルト: ${bags.filter(b => b.state === 'belt').length} 個`, 22, 34);
-  ctx.fillText(`処理済: ${s.totalDone} 個`, 22, 50);
-  ctx.fillText(`地面:  ${s.totalFloor} 個`, 22, 66);
+  ctx.fillText(`投入済: ${s.nextId} 個`, 22, 34);
+  ctx.fillText(`ベルト: ${bags.filter(b => b.state === 'belt').length} 個`, 22, 50);
+  ctx.fillText(`処理済: ${s.totalDone} 個`, 22, 66);
+  ctx.fillText(`地面:  ${s.totalFloor} 個`, 22, 82);
 
   // Legend
   ctx.fillStyle = 'rgba(17,24,39,0.85)';
@@ -507,12 +532,12 @@ function drawSim(
     ctx.fillText(label, SW - 122, 24 + i * 16);
   });
 
-  // Belt label
+  // Belt center label
   ctx.fillStyle = '#6B7280';
   ctx.font = '11px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('ベルトコンベア', BX, BY);
+  ctx.fillText('ベルトコンベア', BCX, BCY);
 }
 
 // ── Draw chart canvas ────────────────────────────────────────
@@ -527,7 +552,6 @@ function drawChart(ctx: CanvasRenderingContext2D, s: SimState) {
   const gw = CW - pad.l - pad.r;
   const gh = CH - pad.t - pad.b;
 
-  // Grid
   ctx.strokeStyle = '#1E293B';
   ctx.lineWidth = 1;
   for (let g = 0; g <= 4; g++) {
@@ -540,22 +564,19 @@ function drawChart(ctx: CanvasRenderingContext2D, s: SimState) {
 
   const maxBelt = Math.max(...hist.map(h => h.belt), 1);
   const maxAll = Math.max(maxBelt, ...hist.map(h => h.floor), 5);
-  const maxDone = Math.max(...hist.map(h => h.done), 1);
 
   const px = (i: number) => pad.l + (i / (hist.length - 1)) * gw;
   const pyCount = (v: number) => pad.t + gh - (v / maxAll) * gh;
-  const lines: { key: keyof HistPt; color: string; yFn: (v: number) => number }[] = [
-    { key: 'belt',  color: '#3B82F6', yFn: pyCount },
-    { key: 'floor', color: '#EF4444', yFn: pyCount },
+  const lines: { key: keyof HistPt; color: string }[] = [
+    { key: 'belt', color: '#3B82F6' },
+    { key: 'floor', color: '#EF4444' },
   ];
 
-  void maxDone; // reserved for future done-count axis
-
-  for (const { key, color, yFn } of lines) {
+  for (const { key, color } of lines) {
     ctx.beginPath();
     hist.forEach((h, i) => {
       const v = h[key] as number;
-      const x = px(i), y = yFn(v);
+      const x = px(i), y = pyCount(v);
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     });
     ctx.strokeStyle = color;
@@ -563,7 +584,6 @@ function drawChart(ctx: CanvasRenderingContext2D, s: SimState) {
     ctx.stroke();
   }
 
-  // Per-worker queue lines (faint)
   const wColors = ['#60A5FA','#34D399','#FBBF24','#F87171','#A78BFA','#F472B6'];
   const numW = s.workers.length;
   if (hist[0]?.queues) {
@@ -581,7 +601,6 @@ function drawChart(ctx: CanvasRenderingContext2D, s: SimState) {
     }
   }
 
-  // Y axis label
   ctx.fillStyle = '#64748B';
   ctx.font = '9px sans-serif';
   ctx.textAlign = 'right';
@@ -591,20 +610,18 @@ function drawChart(ctx: CanvasRenderingContext2D, s: SimState) {
     ctx.fillText(String(v), pad.l - 4, pad.t + (gh * g) / 4);
   }
 
-  // X axis time labels
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
   for (let i = 0; i < hist.length; i += Math.max(1, Math.floor(hist.length / 6))) {
     ctx.fillText(`${hist[i].t.toFixed(0)}s`, px(i), pad.t + gh + 4);
   }
 
-  // Legend
   const legItems = [
     { color: '#3B82F6', label: 'ベルト' },
     { color: '#EF4444', label: '地面' },
   ];
   s.workers.forEach((_w, i) => {
-    legItems.push({ color: wColors[i % wColors.length], label: `W${i + 1}待ち` });
+    legItems.push({ color: wColors[i % wColors.length], label: `作業${i + 1}待ち` });
   });
   let lx = pad.l;
   for (const { color, label } of legItems) {
@@ -621,40 +638,31 @@ function drawChart(ctx: CanvasRenderingContext2D, s: SimState) {
 
 // ── Main component ───────────────────────────────────────────
 export default function BaggageSimulation() {
-  const simCanvasRef  = useRef<HTMLCanvasElement>(null);
+  const simCanvasRef   = useRef<HTMLCanvasElement>(null);
   const chartCanvasRef = useRef<HTMLCanvasElement>(null);
-  const stateRef  = useRef<SimState | null>(null);
-  const lastTsRef = useRef<number>(0);
+  const stateRef   = useRef<SimState | null>(null);
+  const lastTsRef  = useRef<number>(0);
   const runningRef = useRef(true);
 
-  // Config state (drives UI)
   const [running, setRunning] = useState(true);
-  const [arrivalRate, setArrivalRate] = useState(0.5);  // bags/sec
-  const [beltSpeed, setBeltSpeed]   = useState(0.06);   // circuits/sec
-  const [simSpeed, setSimSpeed]     = useState(1);
-  const [numWorkers, setNumWorkers] = useState(4);
-  const [maxQueue, setMaxQueue]     = useState(8);
-  const [workerSpeeds, setWorkerSpeeds] = useState<number[]>([0.3, 0.3, 0.3, 0.3, 0.3, 0.3]);
+  const [arrivalRate, setArrivalRate] = useState(0.5);
+  const [beltSpeed, setBeltSpeed]     = useState(0.06);
+  const [simSpeed, setSimSpeed]       = useState(1);
+  const [maxQueue, setMaxQueue]       = useState(8);
+  const [workerSpeeds, setWorkerSpeeds] = useState<number[]>([10, 10, 10, 10]);
   const [stats, setStats] = useState<{ id: number; q: number; floor: number; done: number }[]>([]);
 
-  // Rebuild sim state only when worker count changes
-  const initSim = useCallback((nw?: number) => {
-    const count = nw ?? numWorkers;
-    const positions = Array.from({ length: count }, (_, i) =>
-      (i / count + 0.1) % 1
-    );
-    const speeds = workerSpeeds.slice(0, count);
-    while (speeds.length < count) speeds.push(0.3);
-    stateRef.current = makeState(positions, speeds, maxQueue);
+  // 作業1:上辺中央  作業2:右辺中央  作業3:下辺中央  作業4:左辺中央
+  const WORKER_POSITIONS = [0.02, 0.25, 0.50, 0.75];
+
+  const initSim = useCallback(() => {
+    stateRef.current = makeState(WORKER_POSITIONS, workerSpeeds.slice(0, 4), maxQueue);
     lastTsRef.current = 0;
-  }, [numWorkers, workerSpeeds, maxQueue]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workerSpeeds, maxQueue]);
 
-  useEffect(() => {
-    initSim();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [numWorkers]);
+  useEffect(() => { initSim(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Animation loop
   useEffect(() => {
     let frameId: number;
 
@@ -670,11 +678,11 @@ export default function BaggageSimulation() {
       lastTsRef.current = now;
 
       if (runningRef.current) {
-        // Apply worker speeds from current state
         s.workers.forEach((w, i) => {
-          w.speed = workerSpeeds[i] ?? 0.3;
+          w.speed = 1 / (workerSpeeds[i] ?? 10);
           w.maxQueue = maxQueue;
         });
+
         step(s, wallDt * simSpeed, arrivalRate, beltSpeed);
       }
 
@@ -684,7 +692,6 @@ export default function BaggageSimulation() {
       const chartCtx = chartCanvasRef.current?.getContext('2d');
       if (chartCtx) drawChart(chartCtx, s);
 
-      // Update React stats every ~10 frames
       if (Math.floor(now * 10) % 3 === 0) {
         setStats(s.workers.map(w => ({
           id: w.id,
@@ -704,16 +711,10 @@ export default function BaggageSimulation() {
     setRunning(r => !r);
   };
 
-  const reset = () => {
-    initSim();
-  };
+  const reset = () => { initSim(); };
 
   const updateWorkerSpeed = (i: number, v: number) => {
-    setWorkerSpeeds(prev => {
-      const next = [...prev];
-      next[i] = v;
-      return next;
-    });
+    setWorkerSpeeds(prev => { const next = [...prev]; next[i] = v; return next; });
   };
 
   return (
@@ -722,7 +723,6 @@ export default function BaggageSimulation() {
         空港 手荷物ベルトコンベア シミュレーション
       </h1>
 
-      {/* Simulation canvas */}
       <div className="rounded-lg overflow-hidden border border-gray-700">
         <canvas
           ref={simCanvasRef}
@@ -733,7 +733,6 @@ export default function BaggageSimulation() {
         />
       </div>
 
-      {/* Time-series chart */}
       <div className="rounded-lg overflow-hidden border border-gray-700">
         <canvas
           ref={chartCanvasRef}
@@ -744,16 +743,11 @@ export default function BaggageSimulation() {
         />
       </div>
 
-      {/* Controls + Stats row */}
       <div className="flex gap-4 flex-wrap">
 
-        {/* Global controls */}
         <div className="flex-1 min-w-60 bg-gray-900 rounded-lg p-4 border border-gray-700">
-          <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">
-            全体設定
-          </div>
+          <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">全体設定</div>
 
-          {/* Play/Pause/Reset */}
           <div className="flex gap-2 mb-4">
             <button
               onClick={toggleRunning}
@@ -771,53 +765,24 @@ export default function BaggageSimulation() {
             </button>
           </div>
 
-          <Slider
-            label={`到着レート: ${arrivalRate.toFixed(2)} 個/秒`}
-            min={0.1} max={2.0} step={0.05}
-            value={arrivalRate}
-            onChange={setArrivalRate}
-          />
-          <Slider
-            label={`ベルト速度: ${beltSpeed.toFixed(3)} 周/秒`}
-            min={0.01} max={0.15} step={0.005}
-            value={beltSpeed}
-            onChange={setBeltSpeed}
-          />
-          <Slider
-            label={`シミュレーション速度: ${simSpeed}×`}
-            min={1} max={8} step={1}
-            value={simSpeed}
-            onChange={setSimSpeed}
-          />
-          <Slider
-            label={`最大待ち数: ${maxQueue} 個`}
-            min={2} max={20} step={1}
-            value={maxQueue}
-            onChange={setMaxQueue}
-          />
-          <Slider
-            label={`作業者数: ${numWorkers} 人`}
-            min={1} max={6} step={1}
-            value={numWorkers}
-            onChange={(v) => { setNumWorkers(v); }}
-          />
+          <Slider label={`到着レート: ${arrivalRate.toFixed(2)} 個/秒`} min={0.1} max={2.0} step={0.05} value={arrivalRate} onChange={setArrivalRate} />
+          <Slider label={`ベルト速度: ${beltSpeed.toFixed(3)} 周/秒`} min={0.01} max={0.15} step={0.005} value={beltSpeed} onChange={setBeltSpeed} />
+          <Slider label={`シミュレーション速度: ${simSpeed}×`} min={1} max={8} step={1} value={simSpeed} onChange={setSimSpeed} />
+          <Slider label={`最大待ち数: ${maxQueue} 個`} min={2} max={20} step={1} value={maxQueue} onChange={setMaxQueue} />
         </div>
 
-        {/* Per-worker speeds */}
         <div className="flex-1 min-w-60 bg-gray-900 rounded-lg p-4 border border-gray-700">
-          <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">
-            作業者別処理速度
-          </div>
-          {Array.from({ length: numWorkers }, (_, i) => {
+          <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">作業者別処理速度</div>
+          {Array.from({ length: 4 }, (_, i) => {
             const st = stats[i];
             const q = st?.q ?? 0;
             const col = q >= maxQueue * 0.7 ? 'text-red-400' : q >= maxQueue * 0.4 ? 'text-yellow-400' : 'text-green-400';
             return (
               <div key={i} className="mb-2">
                 <Slider
-                  label={`W${i + 1}: ${(workerSpeeds[i] ?? 0.3).toFixed(2)} 個/秒`}
-                  min={0.05} max={1.0} step={0.05}
-                  value={workerSpeeds[i] ?? 0.3}
+                  label={`作業${i + 1}: ${workerSpeeds[i] ?? 10} 秒/個`}
+                  min={5} max={15} step={1}
+                  value={workerSpeeds[i] ?? 10}
                   onChange={(v) => updateWorkerSpeed(i, v)}
                 />
                 <div className={`text-xs ${col} ml-2`}>
@@ -828,31 +793,23 @@ export default function BaggageSimulation() {
           })}
         </div>
 
-        {/* Per-worker queue bar chart */}
         <div className="flex-1 min-w-48 bg-gray-900 rounded-lg p-4 border border-gray-700">
-          <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">
-            待ち行列比較
-          </div>
-          {stats.slice(0, numWorkers).map((st, i) => {
+          <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">待ち行列比較</div>
+          {stats.slice(0, 4).map((st, i) => {
             const ratio = Math.min(st.q / maxQueue, 1);
             const col = ratio >= 0.7 ? 'bg-red-500' : ratio >= 0.4 ? 'bg-yellow-500' : 'bg-green-500';
-            const isMax = st.q === Math.max(...stats.slice(0, numWorkers).map(s => s.q));
+            const isMax = st.q === Math.max(...stats.slice(0, 4).map(s => s.q));
             return (
               <div key={i} className="mb-2">
                 <div className="flex items-center gap-2">
-                  <span className="text-xs w-8 text-gray-400">W{i + 1}</span>
+                  <span className="text-xs w-10 text-gray-400">作業{i + 1}</span>
                   <div className="flex-1 bg-gray-800 rounded h-4 relative overflow-hidden">
-                    <div
-                      className={`h-full rounded transition-all duration-200 ${col}`}
-                      style={{ width: `${ratio * 100}%` }}
-                    />
+                    <div className={`h-full rounded transition-all duration-200 ${col}`} style={{ width: `${ratio * 100}%` }} />
                   </div>
                   <span className={`text-xs w-6 text-right ${isMax && st.q > 0 ? 'text-red-400 font-bold' : 'text-gray-400'}`}>
                     {st.q}
                   </span>
-                  {isMax && st.q >= 3 && (
-                    <span className="text-red-400 text-xs">⚠</span>
-                  )}
+                  {isMax && st.q >= 3 && <span className="text-red-400 text-xs">⚠</span>}
                 </div>
               </div>
             );
@@ -870,21 +827,15 @@ export default function BaggageSimulation() {
 }
 
 // ── Reusable slider ──────────────────────────────────────────
-function Slider({
-  label, min, max, step, value, onChange,
-}: {
-  label: string;
-  min: number; max: number; step: number;
-  value: number;
-  onChange: (v: number) => void;
+function Slider({ label, min, max, step, value, onChange }: {
+  label: string; min: number; max: number; step: number;
+  value: number; onChange: (v: number) => void;
 }) {
   return (
     <div className="mb-3">
       <div className="text-xs text-gray-300 mb-1">{label}</div>
       <input
-        type="range"
-        min={min} max={max} step={step}
-        value={value}
+        type="range" min={min} max={max} step={step} value={value}
         onChange={e => onChange(Number(e.target.value))}
         className="w-full accent-blue-500 h-1.5 cursor-pointer"
       />
