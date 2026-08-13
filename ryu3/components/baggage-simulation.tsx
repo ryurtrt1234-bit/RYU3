@@ -37,6 +37,45 @@ const DEFAULT_DEST_QTY = 200;
 const DEFAULT_FLOOR_EXTRA_TIME = 4;
 const DEFAULT_FLOOR_MAX = 10;
 
+// ── 荷物投入ルール ─────────────────────────────────────────────
+// 新しい投入ルールを追加する場合は、この配列に1件追加するだけでよい。
+// UIの切り替えバーは INJECTION_RULES を自動で読み取って選択肢を出す。
+interface InjectionRuleContext {
+  spawnedByDest: number[];
+  destLimits: number[];
+  time: number;
+}
+interface InjectionRule {
+  id: string;
+  label: string;
+  description: string;
+  // 投入可能な行先(available)の中から、次に投入する1件を選んで返す
+  pickDestination: (available: number[], ctx: InjectionRuleContext) => number;
+}
+
+const INJECTION_RULES: InjectionRule[] = [
+  {
+    id: 'uniform-random',
+    label: '均等ランダム',
+    description: '投入可能な行先の中からランダムに1つ選ぶ（現行ルール）',
+    pickDestination: (available) => available[Math.floor(Math.random() * available.length)],
+  },
+  // ここに新しいルールを追加していく。例:
+  // {
+  //   id: 'round-robin',
+  //   label: '順番割当',
+  //   description: '投入可能な行先を順番に均等配分する',
+  //   pickDestination: (available, ctx) => {
+  //     const idx = ctx.spawnedByDest.reduce((a, b) => a + b, 0) % available.length;
+  //     return available[idx];
+  //   },
+  // },
+];
+
+function getInjectionRule(id: string): InjectionRule {
+  return INJECTION_RULES.find(r => r.id === id) ?? INJECTION_RULES[0];
+}
+
 // ── Inline chart position (inside belt center) ───────────────
 const CHART_X = 205, CHART_Y = 148, CHART_W = 410, CHART_H = 164;
 
@@ -243,6 +282,7 @@ function step(
   emergencyMargin: number,
   emergencyCollectInterval: number,
   clockwise: boolean,
+  injectionRuleId: string,
 ) {
   s.time += dt;
 
@@ -306,7 +346,11 @@ function step(
         .filter(d => assignedSet.has(d) && s.spawnedByDest[d] < destLimits[d]);
       if (available.length > 0) {
         const spawnPos = INJECT_POSITIONS[s.nextId % INJECT_POSITIONS.length];
-        const dest = available[Math.floor(Math.random() * available.length)];
+        const dest = getInjectionRule(injectionRuleId).pickDestination(available, {
+          spawnedByDest: s.spawnedByDest,
+          destLimits,
+          time: s.time,
+        });
         s.spawnedByDest[dest]++;
 
         const bagFraction = s.bagW / s.beltPerim;
@@ -1081,6 +1125,7 @@ export default function BaggageSimulation() {
     [0], [1], [2], [3],
   ]);
   const [clockwise, setClockwise] = useState(false);
+  const [injectionRuleId, setInjectionRuleId] = useState<string>(INJECTION_RULES[0].id);
   const [destQuantities, setDestQuantities] = useState<number[]>(
     new Array(NUM_DESTS).fill(DEFAULT_DEST_QTY)
   );
@@ -1130,7 +1175,7 @@ export default function BaggageSimulation() {
         });
         const perimMeters = s.beltPerim / PIXELS_PER_METER;
         const circuitsPerSec = beltSpeedMS / perimMeters;
-        step(s, wallDt * simSpeed, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities, pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise);
+        step(s, wallDt * simSpeed, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities, pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId);
 
         // 0-5分は30秒刻み、5分以降は300秒刻みでスナップショット保存
         const snapInterval = s.time < 300 ? 30 : 300;
@@ -1202,7 +1247,7 @@ export default function BaggageSimulation() {
     };
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
-  }, [arrivalInterval, beltSpeedMS, simSpeed, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise]);
+  }, [arrivalInterval, beltSpeedMS, simSpeed, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId]);
 
   const toggleRunning = () => {
     if (!runningRef.current && scrubIndexRef.current !== null) {
@@ -1257,7 +1302,7 @@ export default function BaggageSimulation() {
         w.assignedDests = workerDests[wi] ?? [];
       });
       step(s, dt, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities,
-           pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise);
+           pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId);
 
       // 0-5分は30秒刻み、5分以降は300秒刻みでスナップショット保存
       const snapInterval2 = s.time < 300 ? 30 : 300;
@@ -1310,7 +1355,7 @@ export default function BaggageSimulation() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
       beltSpeedMS, arrivalInterval, floorDropProb, destQuantities, pickupRate, pickupForceThreshold,
-      outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise]);
+      outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId]);
 
   const updateWorkerSpeed = (i: number, v: number) => {
     setWorkerSpeeds(prev => { const next = [...prev]; next[i] = v; return next; });
@@ -1513,6 +1558,28 @@ export default function BaggageSimulation() {
         {/* 全体設定 */}
         <div className="flex-1 min-w-60 bg-gray-900 rounded-lg p-4 border border-gray-700 space-y-3">
           <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">全体設定</div>
+
+          {/* 荷物投入ルール切り替えバー
+              新しいルールを INJECTION_RULES に追加すると、ここに自動でボタンが増える */}
+          <div className="pb-3 border-b border-gray-700">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-xs text-gray-300">荷物投入ルール</span>
+            </div>
+            <div className="flex rounded overflow-hidden border border-gray-600 text-xs font-medium flex-wrap">
+              {INJECTION_RULES.map(rule => (
+                <button
+                  key={rule.id}
+                  onClick={() => setInjectionRuleId(rule.id)}
+                  title={rule.description}
+                  className={`px-3 py-1 ${injectionRuleId === rule.id ? 'bg-blue-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+                >{rule.label}</button>
+              ))}
+            </div>
+            <div className="text-[11px] text-gray-500 mt-1">
+              {getInjectionRule(injectionRuleId).description}
+            </div>
+          </div>
+
           <Slider label={`荷物の投入間隔: ${arrivalInterval.toFixed(2)} 秒/個`}      min={0.25} max={10}  step={0.25} value={arrivalInterval}    onChange={setArrivalInterval} />
           <Slider label={`ピックアップ率: ${(pickupRate * 100).toFixed(0)}%`} min={0}   max={1}    step={0.05}  value={pickupRate}     onChange={setPickupRate} />
           <Slider label={`100％ピックアップ荷物数（ベルト上）: ${pickupForceThreshold} 個以下`} min={10} max={100} step={5} value={pickupForceThreshold} onChange={setPickupForceThreshold} />
