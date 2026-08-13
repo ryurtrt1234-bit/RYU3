@@ -15,6 +15,17 @@ const DEFAULT_BELT_WIDTH_M = 1.5; // meters
 const BCX = 410, BCY = 230;
 const WORKER_OFFSET = 45;
 
+// ── 作業者人数 ────────────────────────────────────────────────
+const DEFAULT_WORKER_COUNT = 4;
+const MAX_WORKERS = 18;
+// 従来の4人時のレイアウト（上辺・右辺・下辺・左辺）はそのまま維持し、
+// それ以外の人数のときはベルト周囲に均等配置する
+const DEFAULT_4_WORKER_POSITIONS = [0.02, 0.27, 0.50, 0.77];
+function generateWorkerPositions(n: number): number[] {
+  if (n === DEFAULT_WORKER_COUNT) return DEFAULT_4_WORKER_POSITIONS;
+  return Array.from({ length: n }, (_, i) => (i / n + 0.02) % 1);
+}
+
 // ── Bag sizing (defaults) ───────────────────────────────────
 const DEFAULT_BAG_L = 0.65; // meters
 const DEFAULT_BAG_W = 0.43; // meters
@@ -958,20 +969,23 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
     }
 
     // Floor queue (床仮置き) - drawn inward from belt
+    // 上辺・下辺（縦方向）の作業者か、右辺・左辺（横方向）の作業者かで配置を分ける
+    const isVerticalWorkerForFloor = Math.abs(ny) > Math.abs(nx);
     if (w.floorQueue.length > 0 || w.activeFloor) {
       const displayFloor = [...(w.activeFloor ? [w.activeFloor] : []), ...w.floorQueue];
       for (let fi = 0; fi < displayFloor.length; fi++) {
         const fb = displayFloor[fi];
         const isActive = fi === 0 && w.activeFloor !== null;
         let drawX: number, drawY: number;
-        if (w.id === 0 || w.id === 2) {
-          // 作業1・3（上辺・下辺）: 左方向へ縦3個ずつのカラムで配置
+        if (isVerticalWorkerForFloor) {
+          // 上辺・下辺: 左方向へ縦3個ずつのカラムで配置
           const col = Math.floor(fi / 3);
           const row = fi % 3;
           drawX = wx - 33 - col * 13;
           drawY = wy + row * 11 - 11;
         } else {
-          const pileCy = (w.id === 1 || w.id === 3) ? wy + 55 : wy;
+          // 右辺・左辺: 少し下に横3個ずつの行で配置
+          const pileCy = wy + 55;
           drawX = wx + (fi % 3) * 13 - 13;
           drawY = pileCy + Math.floor(fi / 3) * 11 - 4;
         }
@@ -985,8 +999,8 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
         }
       }
       const totalFloorCount = (w.activeFloor ? 1 : 0) + w.floorQueue.length;
-      const labelX = (w.id === 0 || w.id === 2) ? wx - 33 - Math.floor((totalFloorCount - 1) / 3) * 13 : wx;
-      const labelY = (w.id === 0 || w.id === 2) ? wy + 22 : ((w.id === 1 || w.id === 3) ? wy + 75 : wy + 20);
+      const labelX = isVerticalWorkerForFloor ? wx - 33 - Math.floor((totalFloorCount - 1) / 3) * 13 : wx;
+      const labelY = isVerticalWorkerForFloor ? wy + 22 : wy + 75;
       ctx.fillStyle = '#FEF3C7'; ctx.font = 'bold 10px sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.fillText(`床:${totalFloorCount}`, labelX, labelY);
@@ -999,40 +1013,36 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
     }
 
     // ── Worker stats box ─────────────────────────────────────
-    // Placed to avoid overlapping the belt track:
-    //   top/bottom workers → above/below the belt (outward) with 13px font
-    //   left/right workers → narrow strip outside belt edge with 11px font
+    // Placed to avoid overlapping the belt track, based on which side of the
+    // belt the worker sits on (top/bottom → circle右隣、右辺/左辺 → 画面外側ストリップ):
+    // 人数が多いときは箱を小さくして重なりを軽減する
     const totalDone = w.doneCount + w.floorDoneCount;
     const totalAssigned = w.assignedDests.reduce(
       (sum, d) => sum + (destQuantities[d] ?? DEFAULT_DEST_QTY), 0
     );
     const floorActive = w.floorQueue.length;
-    const isVerticalWorker = Math.abs(ny) > 0.5;
+    const isVerticalWorker = Math.abs(ny) > Math.abs(nx);
+    const compact = workers.length > 6;
 
     let statsX: number, statsY: number;
-    let boxW: number, boxH: number;
-    let line1: string, line2: string;
-    let fontSize: number;
+    const boxW = compact ? 62 : 90;
+    const boxH = compact ? 24 : 30;
+    const fontSize = compact ? 10 : 13;
+    const line1 = `済 ${totalDone}/${totalAssigned}`;
+    const line2 = `床 ${floorActive}個`;
 
-    line1 = `済 ${totalDone}/${totalAssigned}`;
-    line2 = `床 ${floorActive}個`;
-    boxW = 90; boxH = 30; fontSize = 13;
-    if (w.id === 1) {
-      // 作業2（右辺）: ベルト右外側ストリップ
+    if (isVerticalWorker) {
+      // 上辺・下辺: 作業者サークルの右隣に配置
+      statsX = Math.min(SW - boxW / 2 - 3, wx + 30 + boxW / 2);
+      statsY = Math.max(boxH / 2 + 2, Math.min(SH - boxH / 2 - 2, wy));
+    } else if (nx > 0) {
+      // 右辺: ベルト右外側ストリップ
       statsX = SW - boxW / 2 - 5;
       statsY = Math.max(boxH / 2 + 3, wy - 30 - boxH / 2);
-    } else if (w.id === 3) {
-      // 作業4（左辺）: ベルト左外側ストリップ
+    } else {
+      // 左辺: ベルト左外側ストリップ
       statsX = boxW / 2 + 5;
       statsY = Math.max(boxH / 2 + 3, wy - 30 - boxH / 2);
-    } else if (w.id === 0) {
-      // 作業1（上辺）: 作業者サークルの右隣に配置
-      statsX = Math.min(SW - boxW / 2 - 3, wx + 30 + boxW / 2);
-      statsY = Math.max(boxH / 2 + 2, Math.min(SH - boxH / 2 - 2, wy));
-    } else {
-      // 作業3（下辺）: 作業者サークルの右隣に配置
-      statsX = Math.min(SW - boxW / 2 - 3, wx + 30 + boxW / 2);
-      statsY = Math.max(boxH / 2 + 2, Math.min(SH - boxH / 2 - 2, wy));
     }
 
     ctx.fillStyle = 'rgba(17,24,39,0.9)';
@@ -1133,7 +1143,10 @@ export default function BaggageSimulation() {
   const [bagWidth, setBagWidth]           = useState(DEFAULT_BAG_W);
   const [beltSpeedMS, setBeltSpeedMS]     = useState(0.4);
   const [simSpeed, setSimSpeed]           = useState(10);
-  const [workerSpeeds, setWorkerSpeeds]   = useState<number[]>([10, 10, 10, 10]);
+  const [workerCount, setWorkerCount]     = useState(DEFAULT_WORKER_COUNT);
+  const [workerSpeeds, setWorkerSpeeds]   = useState<number[]>(
+    new Array(MAX_WORKERS).fill(10)
+  );
   const [floorDropProb, setFloorDropProb]         = useState(0.3);
   const [pickupRate, setPickupRate]               = useState(0.5);
   const [pickupForceThreshold, setPickupForceThreshold] = useState(50);
@@ -1146,9 +1159,10 @@ export default function BaggageSimulation() {
   const [innerLaneCapacity, setInnerLaneCapacity] = useState(100);
   const [emergencyMargin, setEmergencyMargin]             = useState(20);
   const [emergencyCollectInterval, setEmergencyCollectInterval] = useState(3);
-  const [workerDests, setWorkerDests]     = useState<number[][]>([
-    [0], [1], [2], [3],
-  ]);
+  const [workerDests, setWorkerDests]     = useState<number[][]>(
+    // 最初の4人はこれまで通り便を1つずつ担当、5人目以降は未割当（担当なし）で開始
+    Array.from({ length: MAX_WORKERS }, (_, i) => (i < DEFAULT_WORKER_COUNT ? [i] : []))
+  );
   const [clockwise, setClockwise] = useState(false);
   const [injectionRuleId, setInjectionRuleId] = useState<string>(INJECTION_RULES[0].id);
   // 「エクセル読み込み」ルール用の状態
@@ -1215,12 +1229,10 @@ export default function BaggageSimulation() {
   const [overlayStats, setOverlayStats] = useState<{ time: number; spawned: number; belt: number; done: number; floor: number; totalFloor: number; overflow: number; firstOuterExceedTime: number | null; firstOverflowTime: number | null; emergencyStopCount: number; emergencyStopTotalTime: number }>({ time: 0, spawned: 0, belt: 0, done: 0, floor: 0, totalFloor: 0, overflow: 0, firstOuterExceedTime: null, firstOverflowTime: null, emergencyStopCount: 0, emergencyStopTotalTime: 0 });
   const [isEmergencyStop, setIsEmergencyStop] = useState(false);
 
-  const WORKER_POSITIONS = [0.02, 0.27, 0.50, 0.77];
-
   const initSim = useCallback(() => {
     stateRef.current = makeState(
-      WORKER_POSITIONS,
-      workerSpeeds.slice(0, 4),
+      generateWorkerPositions(workerCount),
+      workerSpeeds.slice(0, workerCount),
       workerDests,
       beltLongSide,
       beltShortSide,
@@ -1231,7 +1243,7 @@ export default function BaggageSimulation() {
     );
     lastTsRef.current = 0;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth]);
+  }, [workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth]);
 
   useEffect(() => { initSim(); }, [initSim]);
 
@@ -1325,7 +1337,7 @@ export default function BaggageSimulation() {
     };
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
-  }, [arrivalInterval, beltSpeedMS, simSpeed, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId]);
+  }, [arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId]);
 
   const toggleRunning = () => {
     if (!runningRef.current && scrubIndexRef.current !== null) {
@@ -1362,8 +1374,8 @@ export default function BaggageSimulation() {
     setSnapshotCount(0);
 
     const s = makeState(
-      WORKER_POSITIONS,
-      workerSpeeds.slice(0, 4),
+      generateWorkerPositions(workerCount),
+      workerSpeeds.slice(0, workerCount),
       workerDests,
       beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
       excelSequenceRef.current,
@@ -1432,7 +1444,7 @@ export default function BaggageSimulation() {
       emergencyStopTotalTime: snap.emergencyStopTotalTime,
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
+  }, [workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
       beltSpeedMS, arrivalInterval, floorDropProb, destQuantities, pickupRate, pickupForceThreshold,
       outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId]);
 
@@ -1440,7 +1452,7 @@ export default function BaggageSimulation() {
     setWorkerSpeeds(prev => { const next = [...prev]; next[i] = v; return next; });
   };
   const updateAllWorkerSpeeds = (v: number) => {
-    setWorkerSpeeds([v, v, v, v]);
+    setWorkerSpeeds(new Array(MAX_WORKERS).fill(v));
   };
   const toggleDest = (wi: number, di: number) => {
     setWorkerDests(prev => {
@@ -1733,13 +1745,21 @@ export default function BaggageSimulation() {
           <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">作業者別処理速度</div>
           <div className="pb-2 border-b border-gray-700">
             <Slider
+              label={`作業者人数: ${workerCount}人`}
+              min={1} max={MAX_WORKERS} step={1}
+              value={workerCount}
+              onChange={setWorkerCount}
+            />
+          </div>
+          <div className="pb-2 border-b border-gray-700">
+            <Slider
               label={`一括処理時間調整: ${workerSpeeds[0] ?? 10} 秒/個`}
               min={5} max={15} step={1}
               value={workerSpeeds[0] ?? 10}
               onChange={updateAllWorkerSpeeds}
             />
           </div>
-          {Array.from({ length: 4 }, (_, i) => {
+          {Array.from({ length: workerCount }, (_, i) => {
             const st = stats[i];
             const q = st?.q ?? 0;
             const col = q >= 6 ? 'text-red-400' : q >= 3 ? 'text-yellow-400' : 'text-green-400';
@@ -1762,14 +1782,14 @@ export default function BaggageSimulation() {
         {/* 待ち行列比較 */}
         <div className="flex-1 min-w-48 bg-gray-900 rounded-lg p-4 border border-gray-700">
           <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">待ち行列比較</div>
-          {stats.slice(0, 4).map((st, i) => {
+          {stats.slice(0, workerCount).map((st, i) => {
             const total = st.q + st.floor;
             const maxScale = 20;
             const qRatio = Math.min(st.q / maxScale, 1);
             const floorRatio = Math.min(st.floor / maxScale, 1);
             const col = total >= 11 ? 'bg-red-500' : total >= 6 ? 'bg-yellow-500' : 'bg-green-500';
             const floorCol = total >= 11 ? 'bg-red-300' : total >= 6 ? 'bg-yellow-300' : 'bg-green-300';
-            const isMax = total === Math.max(...stats.slice(0, 4).map(s => s.q + s.floor));
+            const isMax = total === Math.max(...stats.slice(0, workerCount).map(s => s.q + s.floor));
             return (
               <div key={i} className="mb-3">
                 <div className="flex items-center gap-2 mb-0.5">
@@ -1838,8 +1858,8 @@ export default function BaggageSimulation() {
             </div>
           ))}
         </div>
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          {Array.from({ length: 4 }, (_, wi) => (
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-6">
+          {Array.from({ length: workerCount }, (_, wi) => (
             <div key={wi} className="bg-gray-800 rounded-lg p-3 border border-gray-700">
               <div className="text-xs font-bold text-gray-200 mb-2">作業{wi + 1}</div>
               <div className="flex flex-wrap gap-1">
