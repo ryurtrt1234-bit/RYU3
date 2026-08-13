@@ -44,6 +44,9 @@ interface InjectionRuleContext {
   spawnedByDest: number[];
   destLimits: number[];
   time: number;
+  // 「エクセル読み込み」ルール用: アップロードされたファイルから作られた
+  // 未消化の行先(destination index)の待ち行列。pickDestination内でshiftして消費してよい。
+  excelQueue: number[];
 }
 interface InjectionRule {
   id: string;
@@ -51,6 +54,8 @@ interface InjectionRule {
   description: string;
   // 投入可能な行先(available)の中から、次に投入する1件を選んで返す
   pickDestination: (available: number[], ctx: InjectionRuleContext) => number;
+  // このルールを選んだときだけ表示する追加UI(ファイルアップロード欄など)があればtrue
+  needsFileUpload?: boolean;
 }
 
 const INJECTION_RULES: InjectionRule[] = [
@@ -59,6 +64,22 @@ const INJECTION_RULES: InjectionRule[] = [
     label: '均等ランダム',
     description: '投入可能な行先の中からランダムに1つ選ぶ（現行ルール）',
     pickDestination: (available) => available[Math.floor(Math.random() * available.length)],
+  },
+  {
+    id: 'excel-import',
+    label: 'エクセル読み込み',
+    description: 'アップロードしたエクセルファイルに記載された順番通りに行先を投入する',
+    needsFileUpload: true,
+    pickDestination: (available, ctx) => {
+      // 待ち行列の先頭から順に、現在投入可能な行先が見つかるまで消費する
+      while (ctx.excelQueue.length > 0) {
+        const next = ctx.excelQueue.shift()!;
+        if (available.includes(next)) return next;
+        // その行先が上限到達/未割当などで投入不可の場合は読み飛ばす
+      }
+      // エクセルデータが未読込み、または使い切った場合は均等ランダムにフォールバック
+      return available[Math.floor(Math.random() * available.length)];
+    },
   },
   // ここに新しいルールを追加していく。例:
   // {
@@ -149,6 +170,7 @@ interface SimState {
   emergencyStop: boolean;
   emergencyStopCount: number;
   emergencyStopTotalTime: number;
+  excelQueue: number[]; // 「エクセル読み込み」ルール用: 未消化の行先(destination index)の待ち行列
 }
 
 // ── Belt geometry calculations ──────────────────────────────
@@ -233,6 +255,7 @@ function makeState(
   bagLen: number,
   bagWidth: number,
   beltWidthM: number,
+  excelSeed: number[] = [],
 ): SimState {
   const beltW = beltLongSide * PIXELS_PER_METER;
   const beltH = beltShortSide * PIXELS_PER_METER;
@@ -259,6 +282,7 @@ function makeState(
     emergencyStop: false,
     emergencyStopCount: 0,
     emergencyStopTotalTime: 0,
+    excelQueue: [...excelSeed],
   };
 }
 
@@ -350,6 +374,7 @@ function step(
           spawnedByDest: s.spawnedByDest,
           destLimits,
           time: s.time,
+          excelQueue: s.excelQueue,
         });
         s.spawnedByDest[dest]++;
 
@@ -1126,6 +1151,58 @@ export default function BaggageSimulation() {
   ]);
   const [clockwise, setClockwise] = useState(false);
   const [injectionRuleId, setInjectionRuleId] = useState<string>(INJECTION_RULES[0].id);
+  // 「エクセル読み込み」ルール用の状態
+  const excelSequenceRef = useRef<number[]>([]); // 読み込んだ行先の並び(destination index)
+  const [excelFileName, setExcelFileName] = useState<string | null>(null);
+  const [excelParsedCount, setExcelParsedCount] = useState(0);
+  const [excelUnmatchedCount, setExcelUnmatchedCount] = useState(0);
+  const [excelError, setExcelError] = useState<string | null>(null);
+
+  const handleExcelFile = useCallback(async (file: File) => {
+    setExcelError(null);
+    try {
+      const XLSX = await import('xlsx');
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows: unknown[][] = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+
+      const nameToIndex = new Map<string, number>(
+        DEST_NAMES.map((name, i) => [name.toUpperCase(), i])
+      );
+      const sequence: number[] = [];
+      let unmatched = 0;
+      for (const row of rows) {
+        for (const cell of row) {
+          if (cell === null || cell === undefined || cell === '') continue;
+          const key = String(cell).trim().toUpperCase();
+          const idx = nameToIndex.get(key);
+          if (idx !== undefined) {
+            sequence.push(idx);
+          } else {
+            unmatched++;
+          }
+        }
+      }
+
+      excelSequenceRef.current = sequence;
+      setExcelFileName(file.name);
+      setExcelParsedCount(sequence.length);
+      setExcelUnmatchedCount(unmatched);
+
+      // 読み込んだ内容を、現在のシミュレーション状態にも即反映する
+      if (stateRef.current) {
+        stateRef.current.excelQueue = [...sequence];
+      }
+
+      if (sequence.length === 0) {
+        setExcelError('便名（例: NH101）を含むセルが見つかりませんでした。フォーマットをご確認ください。');
+      }
+    } catch (err) {
+      setExcelError('ファイルの読み込みに失敗しました。.xlsx / .xls / .csv 形式か確認してください。');
+      console.error(err);
+    }
+  }, []);
   const [destQuantities, setDestQuantities] = useState<number[]>(
     new Array(NUM_DESTS).fill(DEFAULT_DEST_QTY)
   );
@@ -1149,7 +1226,8 @@ export default function BaggageSimulation() {
       beltShortSide,
       bagLength,
       bagWidth,
-      beltWidth
+      beltWidth,
+      excelSequenceRef.current
     );
     lastTsRef.current = 0;
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1288,6 +1366,7 @@ export default function BaggageSimulation() {
       workerSpeeds.slice(0, 4),
       workerDests,
       beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
+      excelSequenceRef.current,
     );
     stateRef.current = s;
 
@@ -1578,6 +1657,41 @@ export default function BaggageSimulation() {
             <div className="text-[11px] text-gray-500 mt-1">
               {getInjectionRule(injectionRuleId).description}
             </div>
+
+            {getInjectionRule(injectionRuleId).needsFileUpload && (
+              <div className="mt-2 p-2 bg-gray-800 rounded border border-gray-700">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <span className="px-2 py-1 bg-blue-700 hover:bg-blue-600 text-white text-[11px] rounded font-medium">
+                    ファイルを選択
+                  </span>
+                  <span className="text-[11px] text-gray-400 truncate">
+                    {excelFileName ?? '未選択（1列目に便名を上から順に記入したxlsx/xls/csv）'}
+                  </span>
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) handleExcelFile(f);
+                      e.target.value = '';
+                    }}
+                  />
+                </label>
+                {excelFileName && !excelError && (
+                  <div className="text-[11px] text-green-500 mt-1">
+                    {excelParsedCount} 件読み込みました
+                    {excelUnmatchedCount > 0 && `（便名と一致しないセル ${excelUnmatchedCount} 件はスキップ）`}
+                  </div>
+                )}
+                {excelError && (
+                  <div className="text-[11px] text-red-400 mt-1">{excelError}</div>
+                )}
+                <div className="text-[11px] text-gray-500 mt-1">
+                  対応便名: {DEST_NAMES.join(' / ')}
+                </div>
+              </div>
+            )}
           </div>
 
           <Slider label={`荷物の投入間隔: ${arrivalInterval.toFixed(2)} 秒/個`}      min={0.25} max={10}  step={0.25} value={arrivalInterval}    onChange={setArrivalInterval} />
