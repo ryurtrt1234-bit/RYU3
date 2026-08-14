@@ -152,9 +152,9 @@ export default function RequirementsEditor() {
                   <input
                     type="number"
                     min={1}
-                    max={20}
+                    max={100}
                     value={form.workerCount}
-                    onChange={(e) => updateField('workerCount', Number(e.target.value) || 1)}
+                    onChange={(e) => updateField('workerCount', Math.min(100, Math.max(1, Number(e.target.value) || 1)))}
                     className="input"
                   />
                 </Field>
