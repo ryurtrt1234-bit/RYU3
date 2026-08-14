@@ -19,12 +19,46 @@ const WORKER_OFFSET = 45;
 // ── 作業者人数 ────────────────────────────────────────────────
 const DEFAULT_WORKER_COUNT = 4;
 const MAX_WORKERS = 20;
-// 従来の4人時のレイアウト（上辺・右辺・下辺・左辺）はそのまま維持し、
-// それ以外の人数のときはベルト周囲に均等配置する
-const DEFAULT_4_WORKER_POSITIONS = [0.02, 0.27, 0.50, 0.77];
-function generateWorkerPositions(n: number): number[] {
-  if (n === DEFAULT_WORKER_COUNT) return DEFAULT_4_WORKER_POSITIONS;
-  return Array.from({ length: n }, (_, i) => (i / n + 0.02) % 1);
+
+// 作業者は「作業1」から順に、下辺→上辺→右辺→左辺の順番でラウンドロビンに配置する。
+// （5人目は再び下辺、6人目は上辺…というように便数に応じて作業Noを増やしながら巡回する）
+// t=0が上辺中央、t=0.25が右辺中央、t=0.5が下辺中央、t=0.75が左辺中央になる
+// （beltInfoの円周パラメータ化の対称性により、ベルトの縦横比によらず常にこの位置になる）。
+const WORKER_EDGE_ORDER: { center: number; lengthKey: 'W_IN' | 'H_IN' }[] = [
+  { center: 0.5,  lengthKey: 'W_IN' }, // 下辺
+  { center: 0.0,  lengthKey: 'W_IN' }, // 上辺
+  { center: 0.25, lengthKey: 'H_IN' }, // 右辺
+  { center: 0.75, lengthKey: 'H_IN' }, // 左辺
+];
+function generateWorkerPositions(n: number, beltLongSideM: number, beltShortSideM: number): number[] {
+  const BW = beltLongSideM * PIXELS_PER_METER;
+  const BH = beltShortSideM * PIXELS_PER_METER;
+  const BR = Math.min(BW, BH) * 0.25;
+  const W_IN = BW - 2 * BR;
+  const H_IN = BH - 2 * BR;
+  const CORNER = (Math.PI / 2) * BR;
+  const PERIM = 2 * W_IN + 2 * H_IN + 4 * CORNER;
+  const edgeLength = { W_IN, H_IN };
+
+  // 下辺→上辺→右辺→左辺の順に1人ずつ巡回して割り当てる
+  const edgeAssign: number[][] = WORKER_EDGE_ORDER.map(() => []);
+  for (let i = 0; i < n; i++) edgeAssign[i % 4].push(i);
+
+  const positions = new Array(n).fill(0);
+  WORKER_EDGE_ORDER.forEach((edge, ei) => {
+    const idxs = edgeAssign[ei];
+    const count = idxs.length;
+    if (count === 0) return;
+    // コーナー付近を避けるため辺の中央80%だけを使って均等配置する
+    const usableLenFrac = (edgeLength[edge.lengthKey] * 0.8) / PERIM;
+    idxs.forEach((workerIdx, slot) => {
+      const frac = count === 1 ? 0.5 : (slot + 0.5) / count;
+      const offset = (frac - 0.5) * usableLenFrac;
+      positions[workerIdx] = ((edge.center + offset) % 1 + 1) % 1;
+    });
+  });
+
+  return positions;
 }
 
 // ── Bag sizing (defaults) ───────────────────────────────────
@@ -35,11 +69,15 @@ const DEFAULT_BAG_W = 0.43; // meters
 const INJECT_POSITIONS = [0.25, 0.75];
 
 // ── Destinations ─────────────────────────────────────────────
-const NUM_DESTS = 10;
+// エクセル読み込みルールでは便ごとに1つの行先枠を使うため、作業者上限と同数まで確保する
+const NUM_DESTS = MAX_WORKERS;
 const DEST_COLORS = [
   '#3B82F6', '#F59E0B', '#10B981', '#EF4444',
   '#8B5CF6', '#EC4899', '#06B6D4', '#84CC16',
   '#F97316', '#14B8A6',
+  '#A855F7', '#F43F5E', '#0EA5E9', '#22C55E',
+  '#EAB308', '#6366F1', '#D946EF', '#FB7185',
+  '#2DD4BF', '#FACC15',
 ];
 const DEST_NAMES = [
   'NH101', 'JL202', 'GK303', 'MM404', 'BC505',
@@ -56,9 +94,6 @@ interface InjectionRuleContext {
   spawnedByDest: number[];
   destLimits: number[];
   time: number;
-  // 「エクセル読み込み」ルール用: アップロードされたファイルから作られた
-  // 未消化の行先(destination index)の待ち行列。pickDestination内でshiftして消費してよい。
-  excelQueue: number[];
 }
 interface InjectionRule {
   id: string;
@@ -80,18 +115,11 @@ const INJECTION_RULES: InjectionRule[] = [
   {
     id: 'excel-import',
     label: 'エクセル読み込み',
-    description: 'アップロードしたエクセルファイルに記載された順番通りに行先を投入する',
+    description: '読み込んだエクセルの便名・時間帯別投入数に従って便ごとに作業者を自動配置し、時刻通りに投入する',
     needsFileUpload: true,
-    pickDestination: (available, ctx) => {
-      // 待ち行列の先頭から順に、現在投入可能な行先が見つかるまで消費する
-      while (ctx.excelQueue.length > 0) {
-        const next = ctx.excelQueue.shift()!;
-        if (available.includes(next)) return next;
-        // その行先が上限到達/未割当などで投入不可の場合は読み飛ばす
-      }
-      // エクセルデータが未読込み、または使い切った場合は均等ランダムにフォールバック
-      return available[Math.floor(Math.random() * available.length)];
-    },
+    // 実際の投入タイミング・行先は step() 内で s.flightEvents のスケジュールに従って直接処理される。
+    // ファイル未読込み時のみ、このフォールバック（均等ランダム）が使われる。
+    pickDestination: (available) => available[Math.floor(Math.random() * available.length)],
   },
   // ここに新しいルールを追加していく。例:
   // {
@@ -147,6 +175,9 @@ interface WorkerDef {
   assignedDests: number[];
   emergencyCollectTimer: number;
   travelTimer: number;
+  // 「エクセル読み込み」ルール用: 担当便の荷物が初めて投入されるまで非表示、
+  // 担当便の荷物が全て投入されたら再び非表示にする。それ以外のルールでは常にtrue。
+  visible: boolean;
 }
 
 interface HistPt {
@@ -182,7 +213,14 @@ interface SimState {
   emergencyStop: boolean;
   emergencyStopCount: number;
   emergencyStopTotalTime: number;
-  excelQueue: number[]; // 「エクセル読み込み」ルール用: 未消化の行先(destination index)の待ち行列
+  // 「エクセル読み込み」ルール用: 便ごとの投入スケジュール（時刻順）と、次に処理すべき位置
+  flightEvents: FlightSpawnEvent[] | null;
+  flightEventIdx: number;
+}
+
+interface FlightSpawnEvent {
+  time: number; // 秒（シミュレーション開始からの経過時間）
+  dest: number; // 行先(destination index) = 便に割り当てられた作業者のindex
 }
 
 // ── Belt geometry calculations ──────────────────────────────
@@ -267,7 +305,7 @@ function makeState(
   bagLen: number,
   bagWidth: number,
   beltWidthM: number,
-  excelSeed: number[] = [],
+  flightEvents: FlightSpawnEvent[] | null = null,
 ): SimState {
   const beltW = beltLongSide * PIXELS_PER_METER;
   const beltH = beltShortSide * PIXELS_PER_METER;
@@ -277,12 +315,16 @@ function makeState(
   const bagW = bagLen * PIXELS_PER_METER;
   const bagH = bagWidth * PIXELS_PER_METER;
 
+  // 便別スケジュールが有効なときは、担当便の荷物が最初に投入されるまで作業者を非表示にする
+  const startHidden = !!flightEvents && flightEvents.length > 0;
+
   const workers: WorkerDef[] = workerPositions.map((pos, i) => ({
     id: i, pos, speed: 1 / workerSpeeds[i],
     queue: [], current: null, procTimer: 0,
     floorQueue: [], activeFloor: null, floorBatchActive: false, floorDoneCount: 0, doneCount: 0,
     assignedDests: assignedDests[i] ?? [],
     emergencyCollectTimer: 0, travelTimer: 0,
+    visible: !startHidden,
   }));
   return {
     bags: [], workers, time: 0, nextSpawn: 0, nextId: 0, hist: [],
@@ -294,8 +336,85 @@ function makeState(
     emergencyStop: false,
     emergencyStopCount: 0,
     emergencyStopTotalTime: 0,
-    excelQueue: [...excelSeed],
+    flightEvents: flightEvents && flightEvents.length > 0 ? flightEvents : null,
+    flightEventIdx: 0,
   };
+}
+
+// ベルト上の空きレーンをスキャンして荷物を1個配置する。配置できたらtrueを返す。
+function placeBagOnBelt(s: SimState, dest: number, spawnPos: number, outerLaneCapacity: number): boolean {
+  const bagFraction = s.bagW / s.beltPerim;
+  const MAX_SCAN = 0.15;
+
+  // 指定レーンをspawnPosから近傍MAX_SCAN範囲でスキャン
+  const scanLane = (lane: 0 | 1): number | null => {
+    let scanPos = spawnPos;
+    let scanned = 0;
+    while (scanned < MAX_SCAN) {
+      const dist = (p: number) => { const v = Math.abs(p - scanPos); return Math.min(v, 1 - v); };
+      if (!s.bags.some(b => b.state === 'belt' && b.lane === lane && dist(b.pos) < bagFraction)) {
+        return scanPos;
+      }
+      scanPos = (scanPos + bagFraction * 0.9) % 1;
+      scanned += bagFraction * 0.9;
+    }
+    return null;
+  };
+
+  // 指定レーンをベルト全周でスキャン（遠くても空きがあれば配置）
+  const scanLaneFull = (lane: 0 | 1): number | null => {
+    const stepSize = bagFraction * 0.4;
+    let scanPos = 0;
+    while (scanPos < 1) {
+      const sp = scanPos;
+      const dist = (p: number) => { const v = Math.abs(p - sp); return Math.min(v, 1 - v); };
+      if (!s.bags.some(b => b.state === 'belt' && b.lane === lane && dist(b.pos) < bagFraction)) {
+        return sp;
+      }
+      scanPos += stepSize;
+    }
+    return null;
+  };
+
+  // 外側レーンが上限に達していたら内側を優先、そうでなければ外側を優先
+  const outerCount = s.bags.filter(b => b.state === 'belt' && b.lane === 1).length;
+  const primaryLane: 0 | 1 = outerCount >= outerLaneCapacity ? 0 : 1;
+  const fallbackLane: 0 | 1 = primaryLane === 1 ? 0 : 1;
+
+  let actualPos: number | null = scanLane(primaryLane);
+  let actualLane: 0 | 1 = primaryLane;
+
+  if (actualPos === null) {
+    // プライマリ近傍に空きなし → フォールバックレーン近傍を試みる
+    actualPos = scanLane(fallbackLane);
+    if (actualPos !== null) actualLane = fallbackLane;
+  }
+
+  if (actualPos === null) {
+    // 近傍に空きなし → 両レーンをベルト全周でスキャン（容量上限チェックなし・物理空きのみ）
+    for (const lane of [primaryLane, fallbackLane] as (0 | 1)[]) {
+      const pos = scanLaneFull(lane);
+      if (pos !== null) { actualPos = pos; actualLane = lane; break; }
+    }
+  }
+
+  if (actualPos === null) return false;
+
+  s.bags.push({
+    id: s.nextId++, pos: actualPos, color: DEST_COLORS[dest], destination: dest,
+    circuits: 0, rejects: 0, state: 'belt', workerId: null, lane: actualLane,
+  });
+  return true;
+}
+
+// 「エクセル読み込み」ルール用: 担当便の荷物が投入されるたびに呼び、
+// 最初の1個で作業者を表示し、その便の投入数が上限に達したら再び非表示にする。
+function markFlightBagFlow(s: SimState, dest: number, destLimits: number[]) {
+  const count = s.spawnedByDest[dest];
+  const worker = s.workers.find(w => w.assignedDests.includes(dest));
+  if (!worker) return;
+  if (count === 1) worker.visible = true;
+  if (destLimits[dest] > 0 && count >= destLimits[dest]) worker.visible = false;
 }
 
 // ── Simulation step ──────────────────────────────────────────
@@ -374,101 +493,72 @@ function step(
   const assignedSet = new Set<number>();
   s.workers.forEach(w => w.assignedDests.forEach(d => assignedSet.add(d)));
 
-  const totalLimit = destLimits.reduce((a, b, i) => assignedSet.has(i) ? a + b : a, 0);
-  const totalSpawned = s.spawnedByDest.reduce((a, b, i) => assignedSet.has(i) ? a + b : a, 0);
-  if (!s.emergencyStop && totalSpawned < totalLimit) {
-    while (s.time >= s.nextSpawn) {
-      const available = Array.from({ length: NUM_DESTS }, (_, i) => i)
-        .filter(d => assignedSet.has(d) && s.spawnedByDest[d] < destLimits[d]);
-      if (available.length > 0) {
-        const spawnPos = INJECT_POSITIONS[s.nextId % INJECT_POSITIONS.length];
-        const dest = getInjectionRule(injectionRuleId).pickDestination(available, {
-          spawnedByDest: s.spawnedByDest,
-          destLimits,
-          time: s.time,
-          excelQueue: s.excelQueue,
-        });
-        s.spawnedByDest[dest]++;
-
-        const bagFraction = s.bagW / s.beltPerim;
-        const MAX_SCAN = 0.15;
-
-        // 指定レーンをspawnPosから近傍MAX_SCAN範囲でスキャン
-        const scanLane = (lane: 0 | 1): number | null => {
-          let scanPos = spawnPos;
-          let scanned = 0;
-          while (scanned < MAX_SCAN) {
-            const dist = (p: number) => { const v = Math.abs(p - scanPos); return Math.min(v, 1 - v); };
-            if (!s.bags.some(b => b.state === 'belt' && b.lane === lane && dist(b.pos) < bagFraction)) {
-              return scanPos;
-            }
-            scanPos = (scanPos + bagFraction * 0.9) % 1;
-            scanned += bagFraction * 0.9;
-          }
-          return null;
-        };
-
-        // 指定レーンをベルト全周でスキャン（遠くても空きがあれば配置）
-        const scanLaneFull = (lane: 0 | 1): number | null => {
-          const step = bagFraction * 0.4;
-          let scanPos = 0;
-          while (scanPos < 1) {
-            const sp = scanPos;
-            const dist = (p: number) => { const v = Math.abs(p - sp); return Math.min(v, 1 - v); };
-            if (!s.bags.some(b => b.state === 'belt' && b.lane === lane && dist(b.pos) < bagFraction)) {
-              return sp;
-            }
-            scanPos += step;
-          }
-          return null;
-        };
-
-        // 外側レーン上限+内側レーン上限の合計を超えたらオーバーフローとしてカウント
+  if (!s.emergencyStop) {
+    if (injectionRuleId === 'excel-import' && s.flightEvents) {
+      // ── 便別スケジュール投入（エクセル読み込みルール） ──────────────
+      // 各便の投入時刻はファイル読み込み時に事前計算済み。時刻が来た順に1個ずつ投入する。
+      while (s.flightEventIdx < s.flightEvents.length && s.time >= s.flightEvents[s.flightEventIdx].time) {
+        const dest = s.flightEvents[s.flightEventIdx].dest;
         const totalBeltCount = s.bags.filter(b => b.state === 'belt').length;
+
         if (totalBeltCount >= outerLaneCapacity + innerLaneCapacity) {
+          // ベルト満杯 → オーバーフローとして扱い、この便の投入完了判定は進める
           if (s.firstOverflowTime === null) s.firstOverflowTime = s.time;
           s.totalOverflow++;
           s.nextId++;
-          s.nextSpawn += arrivalInterval * (0.6 + Math.random() * 0.8);
+          s.spawnedByDest[dest]++;
+          markFlightBagFlow(s, dest, destLimits);
+          s.flightEventIdx++;
           continue;
         }
 
-        // 外側レーンが上限に達していたら内側を優先、そうでなければ外側を優先
-        const outerCount = s.bags.filter(b => b.state === 'belt' && b.lane === 1).length;
-        const primaryLane: 0 | 1 = outerCount >= outerLaneCapacity ? 0 : 1;
-        const fallbackLane: 0 | 1 = primaryLane === 1 ? 0 : 1;
-
-        let actualPos: number | null = scanLane(primaryLane);
-        let actualLane: 0 | 1 = primaryLane;
-
-        if (actualPos === null) {
-          // プライマリ近傍に空きなし → フォールバックレーン近傍を試みる
-          actualPos = scanLane(fallbackLane);
-          if (actualPos !== null) actualLane = fallbackLane;
+        // 2つの投入口からランダムに投入する
+        const spawnPos = INJECT_POSITIONS[Math.random() < 0.5 ? 0 : 1];
+        if (!placeBagOnBelt(s, dest, spawnPos, outerLaneCapacity)) {
+          // 物理的な空きがない → 次のステップで同じ荷物を再試行する
+          break;
         }
-
-        if (actualPos === null) {
-          // 近傍に空きなし → 両レーンをベルト全周でスキャン（容量上限チェックなし・物理空きのみ）
-          for (const lane of [primaryLane, fallbackLane] as (0 | 1)[]) {
-            const pos = scanLaneFull(lane);
-            if (pos !== null) { actualPos = pos; actualLane = lane; break; }
-          }
-        }
-
-        if (actualPos === null) {
-          // 両レーン全周で空きなし → 先行インクリメントを戻して再試行
-          s.spawnedByDest[dest]--;
-          s.nextSpawn += arrivalInterval * (0.6 + Math.random() * 0.8);
-          continue;
-        }
-
-        s.bags.push({
-          id: s.nextId++, pos: actualPos, color: DEST_COLORS[dest], destination: dest,
-          circuits: 0, rejects: 0, state: 'belt', workerId: null, lane: actualLane,
-        });
-
+        s.spawnedByDest[dest]++;
+        markFlightBagFlow(s, dest, destLimits);
+        s.flightEventIdx++;
       }
-      s.nextSpawn += arrivalInterval * (0.6 + Math.random() * 0.8);
+    } else {
+      // ── 既存: 到着間隔ベースの投入（均等ランダム 等） ──────────────
+      const totalLimit = destLimits.reduce((a, b, i) => assignedSet.has(i) ? a + b : a, 0);
+      const totalSpawned = s.spawnedByDest.reduce((a, b, i) => assignedSet.has(i) ? a + b : a, 0);
+      if (totalSpawned < totalLimit) {
+        while (s.time >= s.nextSpawn) {
+          const available = Array.from({ length: NUM_DESTS }, (_, i) => i)
+            .filter(d => assignedSet.has(d) && s.spawnedByDest[d] < destLimits[d]);
+          if (available.length > 0) {
+            const spawnPos = INJECT_POSITIONS[s.nextId % INJECT_POSITIONS.length];
+            const dest = getInjectionRule(injectionRuleId).pickDestination(available, {
+              spawnedByDest: s.spawnedByDest,
+              destLimits,
+              time: s.time,
+            });
+            s.spawnedByDest[dest]++;
+
+            // 外側レーン上限+内側レーン上限の合計を超えたらオーバーフローとしてカウント
+            const totalBeltCount = s.bags.filter(b => b.state === 'belt').length;
+            if (totalBeltCount >= outerLaneCapacity + innerLaneCapacity) {
+              if (s.firstOverflowTime === null) s.firstOverflowTime = s.time;
+              s.totalOverflow++;
+              s.nextId++;
+              s.nextSpawn += arrivalInterval * (0.6 + Math.random() * 0.8);
+              continue;
+            }
+
+            if (!placeBagOnBelt(s, dest, spawnPos, outerLaneCapacity)) {
+              // 両レーン全周で空きなし → 先行インクリメントを戻して再試行
+              s.spawnedByDest[dest]--;
+              s.nextSpawn += arrivalInterval * (0.6 + Math.random() * 0.8);
+              continue;
+            }
+          }
+          s.nextSpawn += arrivalInterval * (0.6 + Math.random() * 0.8);
+        }
+      }
     }
   }
 
@@ -903,16 +993,18 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
     ctx.fillText('投入', arrowCx - inx * 44, arrowCy - iny * 22);
   }
 
-  // Bottleneck detection
-  const bottleneck = workers.reduce((a, b) => {
+  // Bottleneck detection（非表示中の作業者は対象外）
+  const visibleWorkers = workers.filter(w => w.visible);
+  const bottleneck = visibleWorkers.length > 0 ? visibleWorkers.reduce((a, b) => {
     const qa = a.queue.length + (a.current ? 1 : 0);
     const qb = b.queue.length + (b.current ? 1 : 0);
     return qa >= qb ? a : b;
-  });
-  const bottleneckQueue = bottleneck.queue.length + (bottleneck.current ? 1 : 0);
+  }) : null;
+  const bottleneckQueue = bottleneck ? bottleneck.queue.length + (bottleneck.current ? 1 : 0) : 0;
 
-  // Draw workers
+  // Draw workers（「エクセル読み込み」ルールで担当便の荷物が投入されていない/投入完了した作業者は非表示）
   for (const w of workers) {
+    if (!w.visible) continue;
     const [wx, wy] = workerXY(w, s);
     const totalQ = w.queue.length + (w.current ? 1 : 0);
     const col = queueColor(totalQ);
@@ -1180,10 +1272,12 @@ export default function BaggageSimulation() {
   const [clockwise, setClockwise] = useState(savedScenarioRef.current?.clockwise ?? false);
   const [injectionRuleId, setInjectionRuleId] = useState<string>(INJECTION_RULES[0].id);
   // 「エクセル読み込み」ルール用の状態
-  const excelSequenceRef = useRef<number[]>([]); // 読み込んだ行先の並び(destination index)
+  // フォーマット: A列=便名（2行目以降）、C列以降=5分刻みの時間帯ごとの投入数（2行目以降）
+  const excelFlightEventsRef = useRef<FlightSpawnEvent[]>([]); // 読み込んだ全便の投入スケジュール（時刻順）
+  const excelFlightNamesRef = useRef<string[]>([]); // 読み込んだ便名（作業者indexと対応）
   const [excelFileName, setExcelFileName] = useState<string | null>(null);
   const [excelParsedCount, setExcelParsedCount] = useState(0);
-  const [excelUnmatchedCount, setExcelUnmatchedCount] = useState(0);
+  const [excelUnmatchedCount, setExcelUnmatchedCount] = useState(0); // 作業者上限超過でスキップした便数
   const [excelError, setExcelError] = useState<string | null>(null);
 
   const handleExcelFile = useCallback(async (file: File) => {
@@ -1195,36 +1289,65 @@ export default function BaggageSimulation() {
       const sheet = wb.Sheets[wb.SheetNames[0]];
       const rows: unknown[][] = XLSX.utils.sheet_to_json(sheet, { header: 1 });
 
-      const nameToIndex = new Map<string, number>(
-        DEST_NAMES.map((name, i) => [name.toUpperCase(), i])
-      );
-      const sequence: number[] = [];
-      let unmatched = 0;
-      for (const row of rows) {
-        for (const cell of row) {
-          if (cell === null || cell === undefined || cell === '') continue;
-          const key = String(cell).trim().toUpperCase();
-          const idx = nameToIndex.get(key);
-          if (idx !== undefined) {
-            sequence.push(idx);
-          } else {
-            unmatched++;
-          }
+      // 2行目(index1)以降: A列=便名, C列(index2)以降=5分刻みの時間帯ごとの投入数
+      const flightRows: { name: string; counts: number[] }[] = [];
+      for (let r = 1; r < rows.length; r++) {
+        const row = rows[r] ?? [];
+        const rawName = row[0];
+        if (rawName === null || rawName === undefined || String(rawName).trim() === '') continue;
+        const counts: number[] = [];
+        for (let c = 2; c < row.length; c++) {
+          const v = Number(row[c]);
+          counts.push(Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
         }
+        flightRows.push({ name: String(rawName).trim(), counts });
       }
 
-      excelSequenceRef.current = sequence;
+      if (flightRows.length === 0) {
+        setExcelError('A列の2行目以降に便名が見つかりませんでした。フォーマットをご確認ください。');
+        return;
+      }
+
+      const skippedCount = Math.max(0, flightRows.length - MAX_WORKERS);
+      const usedFlights = flightRows.slice(0, MAX_WORKERS);
+
+      // 各便・各5分バケットの投入数を、バケット内で均等な間隔の時刻に展開する
+      const BUCKET_SEC = 5 * 60;
+      const events: FlightSpawnEvent[] = [];
+      const totals = new Array(MAX_WORKERS).fill(0);
+      usedFlights.forEach((flight, dest) => {
+        flight.counts.forEach((count, bucketIdx) => {
+          if (count <= 0) return;
+          totals[dest] += count;
+          const bucketStart = bucketIdx * BUCKET_SEC;
+          const interval = BUCKET_SEC / count;
+          for (let k = 0; k < count; k++) {
+            events.push({ time: bucketStart + interval * (k + 0.5), dest });
+          }
+        });
+      });
+      events.sort((a, b) => a.time - b.time);
+
+      if (events.length === 0) {
+        setExcelError('C列以降に時間帯別の投入数が見つかりませんでした。フォーマットをご確認ください。');
+        return;
+      }
+
+      excelFlightEventsRef.current = events;
+      excelFlightNamesRef.current = usedFlights.map(f => f.name);
       setExcelFileName(file.name);
-      setExcelParsedCount(sequence.length);
-      setExcelUnmatchedCount(unmatched);
+      setExcelParsedCount(events.length);
+      setExcelUnmatchedCount(skippedCount);
+
+      // 便ごとに作業者を1名ずつ自動割当し、投入数もファイルの内容に合わせる
+      setWorkerCount(usedFlights.length);
+      setWorkerDests(Array.from({ length: MAX_WORKERS }, (_, i) => (i < usedFlights.length ? [i] : [])));
+      setDestQuantities(totals);
 
       // 読み込んだ内容を、現在のシミュレーション状態にも即反映する
       if (stateRef.current) {
-        stateRef.current.excelQueue = [...sequence];
-      }
-
-      if (sequence.length === 0) {
-        setExcelError('便名（例: NH101）を含むセルが見つかりませんでした。フォーマットをご確認ください。');
+        stateRef.current.flightEvents = events;
+        stateRef.current.flightEventIdx = 0;
       }
     } catch (err) {
       setExcelError('ファイルの読み込みに失敗しました。.xlsx / .xls / .csv 形式か確認してください。');
@@ -1245,7 +1368,7 @@ export default function BaggageSimulation() {
 
   const initSim = useCallback(() => {
     stateRef.current = makeState(
-      generateWorkerPositions(workerCount),
+      generateWorkerPositions(workerCount, beltLongSide, beltShortSide),
       workerSpeeds.slice(0, workerCount),
       workerDests,
       beltLongSide,
@@ -1253,7 +1376,7 @@ export default function BaggageSimulation() {
       bagLength,
       bagWidth,
       beltWidth,
-      excelSequenceRef.current
+      excelFlightEventsRef.current
     );
     lastTsRef.current = 0;
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1388,11 +1511,11 @@ export default function BaggageSimulation() {
     setSnapshotCount(0);
 
     const s = makeState(
-      generateWorkerPositions(workerCount),
+      generateWorkerPositions(workerCount, beltLongSide, beltShortSide),
       workerSpeeds.slice(0, workerCount),
       workerDests,
       beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
-      excelSequenceRef.current,
+      excelFlightEventsRef.current,
     );
     stateRef.current = s;
 
@@ -1691,7 +1814,7 @@ export default function BaggageSimulation() {
                     ファイルを選択
                   </span>
                   <span className="text-[11px] text-gray-400 truncate">
-                    {excelFileName ?? '未選択（1列目に便名を上から順に記入したxlsx/xls/csv）'}
+                    {excelFileName ?? '未選択（A列=便名、C列以降=5分ごとの投入数を2行目から記入したxlsx/xls/csv）'}
                   </span>
                   <input
                     type="file"
@@ -1706,15 +1829,17 @@ export default function BaggageSimulation() {
                 </label>
                 {excelFileName && !excelError && (
                   <div className="text-[11px] text-green-500 mt-1">
-                    {excelParsedCount} 件読み込みました
-                    {excelUnmatchedCount > 0 && `（便名と一致しないセル ${excelUnmatchedCount} 件はスキップ）`}
+                    {excelFlightNamesRef.current.length}便 / 計{excelParsedCount}個を読み込み、作業者を自動割当しました
+                    {excelUnmatchedCount > 0 && `（作業者上限${MAX_WORKERS}人を超えたため後方の${excelUnmatchedCount}便はスキップ）`}
                   </div>
                 )}
                 {excelError && (
                   <div className="text-[11px] text-red-400 mt-1">{excelError}</div>
                 )}
                 <div className="text-[11px] text-gray-500 mt-1">
-                  対応便名: {DEST_NAMES.join(' / ')}
+                  {excelFlightNamesRef.current.length > 0
+                    ? `読込便: ${excelFlightNamesRef.current.join(' / ')}`
+                    : 'フォーマット: A列=便名(2行目〜) / C列以降=5分ごとの投入数(2行目〜)。1便につき作業者1名を自動割当し、初回投入時に配置・投入完了時に非表示にします。'}
                 </div>
               </div>
             )}
