@@ -1,5 +1,5 @@
-import BaggageSimulation from '@/components/baggage-simulation';
+import RequirementsEditor from '@/components/requirements-editor';
 
 export default function Home() {
-  return <BaggageSimulation />;
+  return <RequirementsEditor />;
 }
