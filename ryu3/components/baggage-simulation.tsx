@@ -87,6 +87,21 @@ const DEFAULT_DEST_QTY = 200;
 const DEFAULT_FLOOR_EXTRA_TIME = 4;
 const DEFAULT_FLOOR_MAX = 10;
 
+// ── 再現可能な乱数（シード固定）────────────────────────────────
+// 「搭載終了」で一括計算した結果と、通常再生（速度1×〜1000×）で実行した結果が
+// 実行のたびに/経路によって変わってしまわないよう、Math.random() の代わりに
+// シード固定の擬似乱数を使う。同じシナリオなら常に同じ乱数列になる。
+const SIM_RNG_SEED = 20260814;
+function mulberry32(seed: number): () => number {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 // ── 荷物投入ルール ─────────────────────────────────────────────
 // 新しい投入ルールを追加する場合は、この配列に1件追加するだけでよい。
 // UIの切り替えバーは INJECTION_RULES を自動で読み取って選択肢を出す。
@@ -94,6 +109,7 @@ interface InjectionRuleContext {
   spawnedByDest: number[];
   destLimits: number[];
   time: number;
+  rng: () => number;
 }
 interface InjectionRule {
   id: string;
@@ -110,7 +126,7 @@ const INJECTION_RULES: InjectionRule[] = [
     id: 'uniform-random',
     label: '均等ランダム',
     description: '投入可能な行先の中からランダムに1つ選ぶ（現行ルール）',
-    pickDestination: (available) => available[Math.floor(Math.random() * available.length)],
+    pickDestination: (available, ctx) => available[Math.floor(ctx.rng() * available.length)],
   },
   {
     id: 'excel-import',
@@ -119,7 +135,7 @@ const INJECTION_RULES: InjectionRule[] = [
     needsFileUpload: true,
     // 実際の投入タイミング・行先は step() 内で s.flightEvents のスケジュールに従って直接処理される。
     // ファイル未読込み時のみ、このフォールバック（均等ランダム）が使われる。
-    pickDestination: (available) => available[Math.floor(Math.random() * available.length)],
+    pickDestination: (available, ctx) => available[Math.floor(ctx.rng() * available.length)],
   },
   // ここに新しいルールを追加していく。例:
   // {
@@ -216,6 +232,8 @@ interface SimState {
   // 「エクセル読み込み」ルール用: 便ごとの投入スケジュール（時刻順）と、次に処理すべき位置
   flightEvents: FlightSpawnEvent[] | null;
   flightEventIdx: number;
+  // シード固定の擬似乱数（再現性確保のため Math.random() の代わりに使う）
+  rng: () => number;
 }
 
 interface FlightSpawnEvent {
@@ -306,6 +324,7 @@ function makeState(
   bagWidth: number,
   beltWidthM: number,
   flightEvents: FlightSpawnEvent[] | null = null,
+  rngSeed: number = SIM_RNG_SEED,
 ): SimState {
   const beltW = beltLongSide * PIXELS_PER_METER;
   const beltH = beltShortSide * PIXELS_PER_METER;
@@ -338,6 +357,7 @@ function makeState(
     emergencyStopTotalTime: 0,
     flightEvents: flightEvents && flightEvents.length > 0 ? flightEvents : null,
     flightEventIdx: 0,
+    rng: mulberry32(rngSeed),
   };
 }
 
@@ -418,7 +438,47 @@ function markFlightBagFlow(s: SimState, dest: number, destLimits: number[]) {
 }
 
 // ── Simulation step ──────────────────────────────────────────
+// 1回の内部更新（stepOnce）あたりの秒数。呼び出し側（通常再生・「搭載終了」一括計算の
+// どちらも）が渡してくる dt がどんなに粗くても、この粒度に細分してから処理することで、
+// ベルト移動・作業者とのすれ違い判定・緊急停止しきい値判定などが dt の大きさに左右されず
+// 常に同じ経路をたどるようにする（＝速度やモードを変えても結果が一致するようにする）。
+const SIM_SUBSTEP = 0.1;
+
 function step(
+  s: SimState,
+  dt: number,
+  arrivalInterval: number,
+  beltSpeed: number,
+  floorDropProb: number,
+  destLimits: number[],
+  pickupRate: number,
+  pickupForceThreshold: number,
+  outerLaneCapacity: number,
+  innerLaneCapacity: number,
+  floorExtraTime: number,
+  floorMax: number,
+  floorBatchThreshold: number,
+  beltFloorTrigger: number,
+  workerTravelTime: number,
+  emergencyMargin: number,
+  emergencyCollectInterval: number,
+  clockwise: boolean,
+  injectionRuleId: string,
+) {
+  let remaining = dt;
+  while (remaining > 1e-9) {
+    const sub = Math.min(SIM_SUBSTEP, remaining);
+    stepOnce(
+      s, sub, arrivalInterval, beltSpeed, floorDropProb, destLimits,
+      pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity,
+      floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger,
+      workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId,
+    );
+    remaining -= sub;
+  }
+}
+
+function stepOnce(
   s: SimState,
   dt: number,
   arrivalInterval: number,
@@ -513,7 +573,7 @@ function step(
         }
 
         // 2つの投入口からランダムに投入する
-        const spawnPos = INJECT_POSITIONS[Math.random() < 0.5 ? 0 : 1];
+        const spawnPos = INJECT_POSITIONS[s.rng() < 0.5 ? 0 : 1];
         if (!placeBagOnBelt(s, dest, spawnPos, outerLaneCapacity)) {
           // 物理的な空きがない → 次のステップで同じ荷物を再試行する
           break;
@@ -536,6 +596,7 @@ function step(
               spawnedByDest: s.spawnedByDest,
               destLimits,
               time: s.time,
+              rng: s.rng,
             });
             s.spawnedByDest[dest]++;
 
@@ -545,18 +606,18 @@ function step(
               if (s.firstOverflowTime === null) s.firstOverflowTime = s.time;
               s.totalOverflow++;
               s.nextId++;
-              s.nextSpawn += arrivalInterval * (0.6 + Math.random() * 0.8);
+              s.nextSpawn += arrivalInterval * (0.6 + s.rng() * 0.8);
               continue;
             }
 
             if (!placeBagOnBelt(s, dest, spawnPos, outerLaneCapacity)) {
               // 両レーン全周で空きなし → 先行インクリメントを戻して再試行
               s.spawnedByDest[dest]--;
-              s.nextSpawn += arrivalInterval * (0.6 + Math.random() * 0.8);
+              s.nextSpawn += arrivalInterval * (0.6 + s.rng() * 0.8);
               continue;
             }
           }
-          s.nextSpawn += arrivalInterval * (0.6 + Math.random() * 0.8);
+          s.nextSpawn += arrivalInterval * (0.6 + s.rng() * 0.8);
         }
       }
     }
@@ -592,10 +653,10 @@ function step(
       if (w.current !== null || w.queue.length > 0) continue;
 
       const effectivePickupRate = beltBagCount <= pickupForceThreshold ? 1.0 : pickupRate;
-      if (Math.random() >= effectivePickupRate) continue;
+      if (s.rng() >= effectivePickupRate) continue;
 
       const forceFloor = beltBagCount >= beltFloorTrigger;
-      if (w.floorQueue.length + (w.activeFloor ? 1 : 0) < floorMax && (forceFloor || Math.random() < floorDropProb)) {
+      if (w.floorQueue.length + (w.activeFloor ? 1 : 0) < floorMax && (forceFloor || s.rng() < floorDropProb)) {
         bag.state = 'floor'; bag.workerId = w.id;
         const ft = (1 / w.speed) + floorExtraTime;
         w.floorQueue.push({ id: bag.id, color: bag.color, timer: ft, maxTimer: ft });
@@ -1205,7 +1266,7 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
 }
 
 // ── Simulation speed options ─────────────────────────────────
-const SIM_SPEED_OPTIONS = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100];
+const SIM_SPEED_OPTIONS = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000];
 
 function fmtSimTime(totalSec: number): string {
   const s = Math.floor(totalSec);
@@ -1745,7 +1806,7 @@ export default function BaggageSimulation() {
               className="w-full accent-blue-500 h-1.5 cursor-pointer"
             />
             <div className="flex justify-between text-xs text-gray-500 mt-1">
-              {[1, 25, 50, 75, 100].map(v => <span key={v}>{v}×</span>)}
+              {[1, 25, 50, 75, 100, 500, 1000].map(v => <span key={v}>{v}×</span>)}
             </div>
           </div>
 
