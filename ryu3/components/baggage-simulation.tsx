@@ -1,12 +1,14 @@
 'use client';
 
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { DEFAULT_SCENARIO_CONFIG, SIM_CONFIG_STORAGE_KEY, type ScenarioConfig } from '@/components/requirements-editor';
 
 // ── Canvas dimensions ────────────────────────────────────────
 const SW = 820;
 const SH = 520;
 const STATS_PANEL_W = 280;
+
+// ── 公開URL（別PCから誰でもアクセスできる本番URL） ──────────────
+const PUBLIC_SIMULATION_URL = 'https://ryu3.vercel.app/simulation';
 
 // ── Belt rectangle (defaults) ──────────────────────────────
 const DEFAULT_LONG_SIDE = 30; // meters
@@ -1274,20 +1276,7 @@ function fmtSimTime(totalSec: number): string {
 }
 
 // ── Main component ───────────────────────────────────────────
-function readSavedScenarioConfig(): Partial<ScenarioConfig> | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    const raw = window.localStorage.getItem(SIM_CONFIG_STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as Partial<ScenarioConfig>) : null;
-  } catch {
-    return null;
-  }
-}
-
 export default function BaggageSimulation() {
-  const savedScenarioRef = useRef<Partial<ScenarioConfig> | null>(null);
-  if (!savedScenarioRef.current) savedScenarioRef.current = readSavedScenarioConfig();
-
   const simCanvasRef          = useRef<HTMLCanvasElement>(null);
   const stateRef              = useRef<SimState | null>(null);
   const lastTsRef             = useRef<number>(0);
@@ -1302,35 +1291,35 @@ export default function BaggageSimulation() {
 
   const [running, setRunning]             = useState(false);
   const [hasStarted, setHasStarted]       = useState(false);
-  const [arrivalInterval, setArrivalInterval] = useState(savedScenarioRef.current?.arrivalInterval ?? 2.75);
-  const [beltLongSide, setBeltLongSide]   = useState(savedScenarioRef.current?.beltLongSide ?? DEFAULT_LONG_SIDE);
-  const [beltShortSide, setBeltShortSide] = useState(savedScenarioRef.current?.beltShortSide ?? DEFAULT_SHORT_SIDE);
-  const [beltWidth, setBeltWidth]         = useState(savedScenarioRef.current?.beltWidth ?? DEFAULT_BELT_WIDTH_M);
-  const [bagLength, setBagLength]         = useState(savedScenarioRef.current?.bagLength ?? DEFAULT_BAG_L);
-  const [bagWidth, setBagWidth]           = useState(savedScenarioRef.current?.bagWidth ?? DEFAULT_BAG_W);
-  const [beltSpeedMS, setBeltSpeedMS]     = useState(savedScenarioRef.current?.beltSpeedMS ?? 0.4);
+  const [arrivalInterval, setArrivalInterval] = useState(2.75);
+  const [beltLongSide, setBeltLongSide]   = useState(DEFAULT_LONG_SIDE);
+  const [beltShortSide, setBeltShortSide] = useState(DEFAULT_SHORT_SIDE);
+  const [beltWidth, setBeltWidth]         = useState(DEFAULT_BELT_WIDTH_M);
+  const [bagLength, setBagLength]         = useState(DEFAULT_BAG_L);
+  const [bagWidth, setBagWidth]           = useState(DEFAULT_BAG_W);
+  const [beltSpeedMS, setBeltSpeedMS]     = useState(0.4);
   const [simSpeed, setSimSpeed]           = useState(10);
-  const [workerCount, setWorkerCount]     = useState(savedScenarioRef.current?.workerCount ?? DEFAULT_WORKER_COUNT);
+  const [workerCount, setWorkerCount]     = useState(DEFAULT_WORKER_COUNT);
   const [workerSpeeds, setWorkerSpeeds]   = useState<number[]>(
     new Array(MAX_WORKERS).fill(10)
   );
-  const [floorDropProb, setFloorDropProb]         = useState(savedScenarioRef.current?.floorDropProb ?? 0.3);
-  const [pickupRate, setPickupRate]               = useState(savedScenarioRef.current?.pickupRate ?? 0.5);
+  const [floorDropProb, setFloorDropProb]         = useState(0.3);
+  const [pickupRate, setPickupRate]               = useState(0.5);
   const [pickupForceThreshold, setPickupForceThreshold] = useState(50);
   const [floorExtraTime, setFloorExtraTime]       = useState(DEFAULT_FLOOR_EXTRA_TIME);
   const [floorMax, setFloorMax]                   = useState(DEFAULT_FLOOR_MAX);
   const [floorBatchThreshold, setFloorBatchThreshold] = useState(5);
   const [beltFloorTrigger, setBeltFloorTrigger]       = useState(90);
-  const [workerTravelTime, setWorkerTravelTime]       = useState(savedScenarioRef.current?.workerTravelTime ?? 2);
-  const [outerLaneCapacity, setOuterLaneCapacity] = useState(savedScenarioRef.current?.outerLaneCapacity ?? 100);
-  const [innerLaneCapacity, setInnerLaneCapacity] = useState(savedScenarioRef.current?.innerLaneCapacity ?? 100);
-  const [emergencyMargin, setEmergencyMargin]             = useState(savedScenarioRef.current?.emergencyMargin ?? 20);
-  const [emergencyCollectInterval, setEmergencyCollectInterval] = useState(savedScenarioRef.current?.emergencyCollectInterval ?? 3);
+  const [workerTravelTime, setWorkerTravelTime]       = useState(2);
+  const [outerLaneCapacity, setOuterLaneCapacity] = useState(100);
+  const [innerLaneCapacity, setInnerLaneCapacity] = useState(100);
+  const [emergencyMargin, setEmergencyMargin]             = useState(20);
+  const [emergencyCollectInterval, setEmergencyCollectInterval] = useState(3);
   const [workerDests, setWorkerDests]     = useState<number[][]>(
     // 最初の4人はこれまで通り便を1つずつ担当、5人目以降は未割当（担当なし）で開始
     Array.from({ length: MAX_WORKERS }, (_, i) => (i < DEFAULT_WORKER_COUNT ? [i] : []))
   );
-  const [clockwise, setClockwise] = useState(savedScenarioRef.current?.clockwise ?? false);
+  const [clockwise, setClockwise] = useState(false);
   const [injectionRuleId, setInjectionRuleId] = useState<string>(INJECTION_RULES[0].id);
   // 「エクセル読み込み」ルール用の状態
   // フォーマット: A列=便名（2行目以降）、C列以降=5分刻みの時間帯ごとの投入数（2行目以降）
@@ -1665,6 +1654,7 @@ export default function BaggageSimulation() {
   };
 
   const [isRecording, setIsRecording] = useState(false);
+  const [urlCopied, setUrlCopied] = useState(false);
 
   const startRecording = useCallback(() => {
     if (!simCanvasRef.current) return;
@@ -1706,6 +1696,24 @@ export default function BaggageSimulation() {
     setIsRecording(false);
   }, []);
 
+  const copyPublicUrl = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(PUBLIC_SIMULATION_URL);
+    } catch {
+      // クリップボードAPIが使えない環境向けのフォールバック
+      const textarea = document.createElement('textarea');
+      textarea.value = PUBLIC_SIMULATION_URL;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+    }
+    setUrlCopied(true);
+    window.setTimeout(() => setUrlCopied(false), 2000);
+  }, []);
+
   return (
     <div className="flex flex-col gap-3 p-4 bg-gray-950 min-h-screen text-gray-100">
       <div className="flex items-center justify-between">
@@ -1713,6 +1721,13 @@ export default function BaggageSimulation() {
           空港手荷物処理能力シミュレーション
         </h1>
         <div className="flex gap-2">
+          <button
+            onClick={copyPublicUrl}
+            className={`px-4 py-1.5 rounded text-sm font-medium ${urlCopied ? 'bg-emerald-600' : 'bg-gray-700 hover:bg-gray-600'}`}
+            title={PUBLIC_SIMULATION_URL}
+          >
+            {urlCopied ? '✓ コピーしました' : '🔗 URLをコピー'}
+          </button>
           <button
             onClick={toggleRunning}
             className={`px-4 py-1.5 rounded text-sm font-medium ${running ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-green-600 hover:bg-green-700'}`}
