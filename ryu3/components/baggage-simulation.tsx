@@ -161,7 +161,9 @@ function getInjectionRule(id: string): InjectionRule {
 }
 
 // ── Inline chart position (inside belt center) ───────────────
-const CHART_X = 205, CHART_Y = 148, CHART_W = 410, CHART_H = 164;
+// 縦方向はベルト内周（既定形状: 短辺14m・ベルト幅1.5mでの内周y:105〜355px）と被らない範囲で
+// 上下に拡張済み（旧: Y=148,H=164 → 新: Y=120,H=220、中心のBCY=230は維持）
+const CHART_X = 205, CHART_Y = 120, CHART_W = 410, CHART_H = 220;
 
 // ── Types ────────────────────────────────────────────────────
 interface FloorBag {
