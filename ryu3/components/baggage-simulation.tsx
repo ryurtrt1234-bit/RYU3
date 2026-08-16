@@ -160,10 +160,38 @@ function getInjectionRule(id: string): InjectionRule {
   return INJECTION_RULES.find(r => r.id === id) ?? INJECTION_RULES[0];
 }
 
-// ── Inline chart position (inside belt center) ───────────────
-// 縦方向はベルト内周（既定形状: 短辺14m・ベルト幅1.5mでの内周y:105〜355px）と被らない範囲で
-// 上下に拡張済み（旧: Y=148,H=164 → 新: Y=120,H=220、中心のBCY=230は維持）
-const CHART_X = 205, CHART_Y = 120, CHART_W = 410, CHART_H = 220;
+// ── Inline chart position (inside belt center, auto-fits current belt size) ──
+// 「理想サイズ」を上限に、ベルト内周（stroke幅を差し引いた穴）に収まる最大の矩形を毎回計算する。
+// 角の丸み（BR）も考慮するので、長辺・短辺・ベルト幅のスライダーをどう動かしても被らない。
+// 既定形状（長辺30m・短辺14m・ベルト幅1.5m）では理想サイズがそのまま収まる。
+const CHART_IDEAL_W = 410, CHART_IDEAL_H = 220;
+const CHART_MARGIN = 15; // ベルト内周からの安全マージン(px)
+
+function computeChartRect(beltW: number, beltH: number, beltR: number, beltWidthPx: number): { x: number; y: number; w: number; h: number } {
+  const holeHalfW = (beltW - beltWidthPx) / 2 - CHART_MARGIN;
+  const holeHalfH = (beltH - beltWidthPx) / 2 - CHART_MARGIN;
+  const rHole = Math.max(0, beltR - beltWidthPx / 2 - CHART_MARGIN);
+
+  let hw = Math.max(0, Math.min(CHART_IDEAL_W / 2, holeHalfW));
+  let hh = Math.max(0, Math.min(CHART_IDEAL_H / 2, holeHalfH));
+
+  // 矩形の角が丸め円弧の外にはみ出さないよう、角に近づくほど内側にクランプする
+  const cx = holeHalfW - rHole;
+  const cy = holeHalfH - rHole;
+  if (hw > cx && hh > cy) {
+    const ex = hw - cx, ey = hh - cy;
+    const dist = Math.sqrt(ex * ex + ey * ey);
+    if (dist > rHole && dist > 0) {
+      const scale = rHole / dist;
+      hw = cx + ex * scale;
+      hh = cy + ey * scale;
+    }
+  }
+
+  const w = Math.max(0, hw * 2);
+  const h = Math.max(0, hh * 2);
+  return { x: BCX - w / 2, y: BCY - h / 2, w, h };
+}
 
 // ── Types ────────────────────────────────────────────────────
 interface FloorBag {
@@ -807,7 +835,7 @@ interface ChartSeriesVisible {
 }
 
 function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCapacity: number, outerLaneCapacity: number, visible: ChartSeriesVisible) {
-  const x = CHART_X, y = CHART_Y, w = CHART_W, h = CHART_H;
+  const { x, y, w, h } = computeChartRect(s.beltW, s.beltH, s.beltR, s.beltWidthPx);
   const pad = { l: 52, r: 44, t: 42, b: 32 };
   const gw = w - pad.l - pad.r;
   const gh = h - pad.t - pad.b;
@@ -1390,6 +1418,13 @@ export default function BaggageSimulation() {
   const [beltLongSide, setBeltLongSide]   = useState(DEFAULT_LONG_SIDE);
   const [beltShortSide, setBeltShortSide] = useState(DEFAULT_SHORT_SIDE);
   const [beltWidth, setBeltWidth]         = useState(DEFAULT_BELT_WIDTH_M);
+  // グラフ枠の位置・サイズ（緊急停止ポップアップの表示位置に使用。実際の描画は canvas 側の drawInlineChart が同じ関数で毎回計算する）
+  const chartRect = computeChartRect(
+    beltLongSide * PIXELS_PER_METER,
+    beltShortSide * PIXELS_PER_METER,
+    Math.min(beltLongSide, beltShortSide) * PIXELS_PER_METER * 0.25,
+    beltWidth * PIXELS_PER_METER,
+  );
   const [bagLength, setBagLength]         = useState(DEFAULT_BAG_L);
   const [bagWidth, setBagWidth]           = useState(DEFAULT_BAG_W);
   const [beltSpeedMS, setBeltSpeedMS]     = useState(0.4);
@@ -1886,8 +1921,8 @@ export default function BaggageSimulation() {
             <div
               className="absolute flex items-center gap-1 bg-red-700/90 text-white rounded px-2 py-0.5 border border-red-400 font-bold whitespace-nowrap"
               style={{
-                bottom: `${((SH - CHART_Y) / SH * 100).toFixed(1)}%`,
-                right: `${((SW - CHART_X - CHART_W + 8) / SW * 100).toFixed(1)}%`,
+                bottom: `${((SH - chartRect.y) / SH * 100).toFixed(1)}%`,
+                right: `${((SW - chartRect.x - chartRect.w + 8) / SW * 100).toFixed(1)}%`,
                 fontSize: '11px',
                 zIndex: 10,
               }}
