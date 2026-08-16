@@ -160,37 +160,51 @@ function getInjectionRule(id: string): InjectionRule {
   return INJECTION_RULES.find(r => r.id === id) ?? INJECTION_RULES[0];
 }
 
-// ── Inline chart position (inside belt center, auto-fits current belt size) ──
-// 「理想サイズ」を上限に、ベルト内周（stroke幅を差し引いた穴）に収まる最大の矩形を毎回計算する。
-// 角の丸み（BR）も考慮するので、長辺・短辺・ベルト幅のスライダーをどう動かしても被らない。
-// 既定形状（長辺38m・短辺6.5m・ベルト幅1.6m）のように短辺が狭い場合は、理想サイズより縮小される。
-const CHART_IDEAL_W = 410, CHART_IDEAL_H = 220;
-const CHART_MARGIN = 15; // ベルト内周からの安全マージン(px)
+// ── Scene layout: ベルト＋作業者＋グラフ（ベルト下）をキャンバス(SW×SH)に収める ──
+// グラフはベルトの下に配置する。ベルトの長辺・短辺・幅や作業者配置がどんな値でも、
+// シーン全体（ベルト＋作業者マージン＋寸法線＋グラフ）を一括で「今の枠」ぎりぎりに
+// 縮小し、絶対にキャンバスからはみ出さないようにする（拡大はしない＝scaleは最大1）。
+const SCENE_MARGIN_SIDE = 100;        // ベルト左右の作業者・統計ボックス用マージン(px, 等倍時)
+const SCENE_MARGIN_TOP = 100;         // ベルト上の作業者用マージン(px, 等倍時)
+const SCENE_MARGIN_BOTTOM_BELT = 100; // ベルト下・寸法線より上の作業者用マージン(px, 等倍時)
+const DIM_LABEL_H = 40;               // 長辺寸法線＋テキストの高さ(px, 等倍時)
+const CHART_GAP = 16;                 // 寸法表示とグラフの間隔(px, 等倍時)
+const CHART_NATURAL_W = 410, CHART_NATURAL_H = 190; // グラフの理想サイズ(px, 等倍時)
 
-function computeChartRect(beltW: number, beltH: number, beltR: number, beltWidthPx: number): { x: number; y: number; w: number; h: number } {
-  const holeHalfW = (beltW - beltWidthPx) / 2 - CHART_MARGIN;
-  const holeHalfH = (beltH - beltWidthPx) / 2 - CHART_MARGIN;
-  const rHole = Math.max(0, beltR - beltWidthPx / 2 - CHART_MARGIN);
+interface SceneLayout {
+  scale: number;
+  tx: number; ty: number; // ctx.translate(tx,ty) の後に ctx.scale(scale,scale) して使う
+  boxLeft: number; boxRight: number; boxTop: number; beltAreaBottom: number; // 等倍座標系でのクランプ用境界
+  chart: { x: number; y: number; w: number; h: number };      // 等倍座標系でのグラフ矩形（canvas描画用）
+  chartFinal: { x: number; y: number; w: number; h: number }; // 変換後の実キャンバス座標系でのグラフ矩形（DOMオーバーレイ配置用）
+}
 
-  let hw = Math.max(0, Math.min(CHART_IDEAL_W / 2, holeHalfW));
-  let hh = Math.max(0, Math.min(CHART_IDEAL_H / 2, holeHalfH));
+function computeSceneLayout(beltW: number, beltH: number): SceneLayout {
+  const groupW = Math.max(beltW + SCENE_MARGIN_SIDE * 2, CHART_NATURAL_W);
+  const boxLeft = BCX - groupW / 2;
+  const boxRight = BCX + groupW / 2;
+  const boxTop = BCY - beltH / 2 - SCENE_MARGIN_TOP;
+  const beltAreaBottom = BCY + beltH / 2 + SCENE_MARGIN_BOTTOM_BELT;
+  const chartX = BCX - CHART_NATURAL_W / 2;
+  const chartY = beltAreaBottom + DIM_LABEL_H + CHART_GAP;
+  const boxBottom = chartY + CHART_NATURAL_H;
+  const groupH = boxBottom - boxTop;
 
-  // 矩形の角が丸め円弧の外にはみ出さないよう、角に近づくほど内側にクランプする
-  const cx = holeHalfW - rHole;
-  const cy = holeHalfH - rHole;
-  if (hw > cx && hh > cy) {
-    const ex = hw - cx, ey = hh - cy;
-    const dist = Math.sqrt(ex * ex + ey * ey);
-    if (dist > rHole && dist > 0) {
-      const scale = rHole / dist;
-      hw = cx + ex * scale;
-      hh = cy + ey * scale;
-    }
-  }
+  const scale = Math.min(SW / groupW, SH / groupH, 1);
+  const tx = (SW - groupW * scale) / 2 - boxLeft * scale;
+  const ty = (SH - groupH * scale) / 2 - boxTop * scale;
 
-  const w = Math.max(0, hw * 2);
-  const h = Math.max(0, hh * 2);
-  return { x: BCX - w / 2, y: BCY - h / 2, w, h };
+  return {
+    scale, tx, ty,
+    boxLeft, boxRight, boxTop, beltAreaBottom,
+    chart: { x: chartX, y: chartY, w: CHART_NATURAL_W, h: CHART_NATURAL_H },
+    chartFinal: {
+      x: tx + chartX * scale,
+      y: ty + chartY * scale,
+      w: CHART_NATURAL_W * scale,
+      h: CHART_NATURAL_H * scale,
+    },
+  };
 }
 
 // ── Types ────────────────────────────────────────────────────
@@ -834,8 +848,8 @@ interface ChartSeriesVisible {
   flights: boolean; // 行先便数（右軸）。投入量・処理済とは右軸を共有できないため排他表示
 }
 
-function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCapacity: number, outerLaneCapacity: number, visible: ChartSeriesVisible) {
-  const { x, y, w, h } = computeChartRect(s.beltW, s.beltH, s.beltR, s.beltWidthPx);
+function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCapacity: number, outerLaneCapacity: number, visible: ChartSeriesVisible, rect: { x: number; y: number; w: number; h: number }) {
+  const { x, y, w, h } = rect;
   const pad = { l: 52, r: 44, t: 42, b: 32 };
   const gw = w - pad.l - pad.r;
   const gh = h - pad.t - pad.b;
@@ -1088,6 +1102,12 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
   ctx.fillStyle = '#111827';
   ctx.fillRect(0, 0, SW, SH);
 
+  // ベルト＋作業者＋グラフ（ベルト下）をキャンバス枠に収める一括縮小変換
+  const layout = computeSceneLayout(BW, BH);
+  ctx.save();
+  ctx.translate(layout.tx, layout.ty);
+  ctx.scale(layout.scale, layout.scale);
+
   const bx = BCX - BW / 2, by = BCY - BH / 2;
 
   // Belt shadow
@@ -1113,9 +1133,6 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
     ctx.moveTo(6, 0); ctx.lineTo(-4, -4); ctx.lineTo(-4, 4); ctx.closePath(); ctx.fill();
     ctx.restore();
   }
-
-  // Inline chart in belt center
-  drawInlineChart(ctx, s, innerLaneCapacity, outerLaneCapacity, chartSeriesVisible);
 
   // Dimension arrows and labels
   const arrowOff = 20;
@@ -1149,6 +1166,9 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
   ctx.beginPath(); ctx.moveTo(sx, sy2); ctx.lineTo(sx - 3, sy2 - 8); ctx.lineTo(sx + 3, sy2 - 8); ctx.fill();
   ctx.save(); ctx.translate(sx + 15, sy1 + (sy2 - sy1) / 4); ctx.rotate(Math.PI / 2);
   ctx.fillText(`${(BH / PIXELS_PER_METER).toFixed(1)}m`, 0, 0); ctx.restore();
+
+  // Inline chart — below the belt (寸法表示の下)
+  drawInlineChart(ctx, s, innerLaneCapacity, outerLaneCapacity, chartSeriesVisible, layout.chart);
 
   // Injection points — arrow pointing outward (toward belt) from just inside inner edge
   for (const injectPos of INJECT_POSITIONS) {
@@ -1307,18 +1327,20 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
     const line1 = `済 ${totalDone}/${totalAssigned}`;
     const line2 = `床 ${floorActive}個`;
 
+    // クランプ境界はシーン変換の等倍座標系（layout.boxLeft/boxRight/boxTop/beltAreaBottom）を使う。
+    // 実キャンバスのSW/SHではない点に注意（シーン全体を縮小しても常にベルトエリア内に収まるように）。
     if (isVerticalWorker) {
       // 上辺・下辺: 作業者サークルの右隣に配置
-      statsX = Math.min(SW - boxW / 2 - 3, wx + 30 + boxW / 2);
-      statsY = Math.max(boxH / 2 + 2, Math.min(SH - boxH / 2 - 2, wy));
+      statsX = Math.min(layout.boxRight - boxW / 2 - 3, wx + 30 + boxW / 2);
+      statsY = Math.max(layout.boxTop + boxH / 2 + 2, Math.min(layout.beltAreaBottom - boxH / 2 - 2, wy));
     } else if (nx > 0) {
       // 右辺: ベルト右外側ストリップ
-      statsX = SW - boxW / 2 - 5;
-      statsY = Math.max(boxH / 2 + 3, wy - 30 - boxH / 2);
+      statsX = layout.boxRight - boxW / 2 - 5;
+      statsY = Math.max(layout.boxTop + boxH / 2 + 3, wy - 30 - boxH / 2);
     } else {
       // 左辺: ベルト左外側ストリップ
-      statsX = boxW / 2 + 5;
-      statsY = Math.max(boxH / 2 + 3, wy - 30 - boxH / 2);
+      statsX = layout.boxLeft + boxW / 2 + 5;
+      statsY = Math.max(layout.boxTop + boxH / 2 + 3, wy - 30 - boxH / 2);
     }
 
     ctx.fillStyle = 'rgba(17,24,39,0.9)';
@@ -1371,6 +1393,8 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
     ctx.restore();
   }
 
+  // シーン変換（ベルト＋作業者＋グラフの一括縮小）をここで終了。以降は実キャンバス座標系で固定表示。
+  ctx.restore();
 
   // Legend — top-right, also above belt
   ctx.fillStyle = 'rgba(17,24,39,0.87)';
@@ -1418,13 +1442,9 @@ export default function BaggageSimulation() {
   const [beltLongSide, setBeltLongSide]   = useState(DEFAULT_LONG_SIDE);
   const [beltShortSide, setBeltShortSide] = useState(DEFAULT_SHORT_SIDE);
   const [beltWidth, setBeltWidth]         = useState(DEFAULT_BELT_WIDTH_M);
-  // グラフ枠の位置・サイズ（緊急停止ポップアップの表示位置に使用。実際の描画は canvas 側の drawInlineChart が同じ関数で毎回計算する）
-  const chartRect = computeChartRect(
-    beltLongSide * PIXELS_PER_METER,
-    beltShortSide * PIXELS_PER_METER,
-    Math.min(beltLongSide, beltShortSide) * PIXELS_PER_METER * 0.25,
-    beltWidth * PIXELS_PER_METER,
-  );
+  // シーン全体（ベルト＋作業者＋グラフ）のレイアウト（緊急停止ポップアップの表示位置に使用。
+  // 実際の描画は canvas 側の drawSim/drawInlineChart が同じ関数で毎回計算する）
+  const sceneLayout = computeSceneLayout(beltLongSide * PIXELS_PER_METER, beltShortSide * PIXELS_PER_METER);
   const [bagLength, setBagLength]         = useState(DEFAULT_BAG_L);
   const [bagWidth, setBagWidth]           = useState(DEFAULT_BAG_W);
   const [beltSpeedMS, setBeltSpeedMS]     = useState(0.4);
@@ -1921,8 +1941,8 @@ export default function BaggageSimulation() {
             <div
               className="absolute flex items-center gap-1 bg-red-700/90 text-white rounded px-2 py-0.5 border border-red-400 font-bold whitespace-nowrap"
               style={{
-                bottom: `${((SH - chartRect.y) / SH * 100).toFixed(1)}%`,
-                right: `${((SW - chartRect.x - chartRect.w + 8) / SW * 100).toFixed(1)}%`,
+                bottom: `${((SH - sceneLayout.chartFinal.y) / SH * 100).toFixed(1)}%`,
+                right: `${((SW - sceneLayout.chartFinal.x - sceneLayout.chartFinal.w + 8) / SW * 100).toFixed(1)}%`,
                 fontSize: '11px',
                 zIndex: 10,
               }}
