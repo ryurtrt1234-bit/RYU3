@@ -103,6 +103,11 @@ function mulberry32(seed: number): () => number {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+// 「ランダム」モード用: リセット（初期化）のたびに新しいシードを引く。
+// 通常再生・搭載終了ともにこの値を使い回すことで、同じ回の中では常に一致した結果になる。
+function drawRandomSeed(): number {
+  return (Date.now() ^ Math.floor(Math.random() * 0xFFFFFFFF)) >>> 0;
+}
 
 // ── 荷物投入ルール ─────────────────────────────────────────────
 // 新しい投入ルールを追加する場合は、この配列に1件追加するだけでよい。
@@ -1369,6 +1374,9 @@ export default function BaggageSimulation() {
   const recordedChunksRef     = useRef<Blob[]>([]);
   const isRecordingRef        = useRef(false);
   const offscreenCanvasRef    = useRef<HTMLCanvasElement | null>(null);
+  // 現在の回で使う乱数シード。「固定」時は常にSIM_RNG_SEED、「ランダム」時はリセット(初期化)のたびに引き直す。
+  // 通常再生と搭載終了は必ずこの同じ値を使うことで、同じ回の中では常に一致する結果になる。
+  const activeSeedRef         = useRef<number>(SIM_RNG_SEED);
 
   const [running, setRunning]             = useState(false);
   const [hasStarted, setHasStarted]       = useState(false);
@@ -1402,6 +1410,8 @@ export default function BaggageSimulation() {
   );
   const [clockwise, setClockwise] = useState(false);
   const [injectionRuleId, setInjectionRuleId] = useState<string>(INJECTION_RULES[0].id);
+  // 乱数シードモード: 'fixed'=常に同じ結果（今までの挙動）/ 'random'=リセットのたびに結果が変わる
+  const [rngMode, setRngMode] = useState<'fixed' | 'random'>('fixed');
   const [chartSeriesVisible, setChartSeriesVisible] = useState<ChartSeriesVisible>({ belt: true, spawned: true, done: true, flights: false });
   const toggleChartSeries = (key: keyof ChartSeriesVisible) => {
     setChartSeriesVisible(prev => {
@@ -1511,6 +1521,8 @@ export default function BaggageSimulation() {
   const [isEmergencyStop, setIsEmergencyStop] = useState(false);
 
   const initSim = useCallback(() => {
+    // 「ランダム」モードならこの初期化のたびに新しいシードを引く。「固定」モードは常にSIM_RNG_SEED。
+    activeSeedRef.current = rngMode === 'random' ? drawRandomSeed() : SIM_RNG_SEED;
     stateRef.current = makeState(
       generateWorkerPositions(workerCount, beltLongSide, beltShortSide),
       workerSpeeds.slice(0, workerCount),
@@ -1520,11 +1532,12 @@ export default function BaggageSimulation() {
       bagLength,
       bagWidth,
       beltWidth,
-      excelFlightEventsRef.current
+      excelFlightEventsRef.current,
+      activeSeedRef.current,
     );
     lastTsRef.current = 0;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth]);
+  }, [workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, rngMode]);
 
   useEffect(() => { initSim(); }, [initSim]);
 
@@ -1657,12 +1670,15 @@ export default function BaggageSimulation() {
     setScrubValue(0);
     setSnapshotCount(0);
 
+    // 現在の回のシード（activeSeedRef）をそのまま使う。ここで引き直すと通常再生とズレるため、
+    // 「ランダム」モードでの新しいシード抽選はinitSim（＝リセット）のときだけ行う。
     const s = makeState(
       generateWorkerPositions(workerCount, beltLongSide, beltShortSide),
       workerSpeeds.slice(0, workerCount),
       workerDests,
       beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
       excelFlightEventsRef.current,
+      activeSeedRef.current,
     );
     stateRef.current = s;
 
@@ -2052,6 +2068,31 @@ export default function BaggageSimulation() {
                 </div>
               </div>
             )}
+          </div>
+
+          {/* 乱数シードモード切り替え: 固定=常に同じ結果 / ランダム=リセットのたびに結果が変わる
+              （どちらでも「搭載終了」と通常再生は同じ回の中では必ず一致する） */}
+          <div className="pb-3 border-b border-gray-700">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-xs text-gray-300">乱数シード</span>
+            </div>
+            <div className="flex rounded overflow-hidden border border-gray-600 text-xs font-medium flex-wrap">
+              <button
+                onClick={() => setRngMode('fixed')}
+                title="常に同じシードを使うため、リセットしても・搭載終了を連打しても毎回同じ結果になります"
+                className={`px-3 py-1 ${rngMode === 'fixed' ? 'bg-blue-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+              >固定（リセットしても同様）</button>
+              <button
+                onClick={() => setRngMode('random')}
+                title="リセットするたびに新しいシードを引くため、結果が変わります（同じ回の中では通常再生・搭載終了は一致します）"
+                className={`px-3 py-1 ${rngMode === 'random' ? 'bg-blue-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+              >ランダム（リセット毎に変化）</button>
+            </div>
+            <div className="text-[11px] text-gray-500 mt-1">
+              {rngMode === 'random'
+                ? 'リセットするたびに投入・ピックアップ等の乱数が引き直されます。同じ回の中では通常再生と搭載終了の結果は一致します。'
+                : '常に同じ乱数列を使うため、リセットしても・搭載終了を何度押しても同じ結果になります。'}
+            </div>
           </div>
 
           <Slider label={`荷物の投入間隔: ${arrivalInterval.toFixed(2)} 秒/個`}      min={0.25} max={10}  step={0.25} value={arrivalInterval}    onChange={setArrivalInterval} />
