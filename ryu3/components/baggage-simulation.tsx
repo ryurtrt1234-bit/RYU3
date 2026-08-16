@@ -11,10 +11,10 @@ const STATS_PANEL_W = 280;
 const PUBLIC_SIMULATION_URL = 'https://ryu3.vercel.app/simulation';
 
 // ── Belt rectangle (defaults) ──────────────────────────────
-const DEFAULT_LONG_SIDE = 30; // meters
-const DEFAULT_SHORT_SIDE = 14; // meters
+const DEFAULT_LONG_SIDE = 38; // meters
+const DEFAULT_SHORT_SIDE = 6.5; // meters
 const PIXELS_PER_METER = 20;
-const DEFAULT_BELT_WIDTH_M = 1.5; // meters
+const DEFAULT_BELT_WIDTH_M = 1.6; // meters
 const BCX = 410, BCY = 230;
 const WORKER_OFFSET = 45;
 
@@ -163,7 +163,7 @@ function getInjectionRule(id: string): InjectionRule {
 // ── Inline chart position (inside belt center, auto-fits current belt size) ──
 // 「理想サイズ」を上限に、ベルト内周（stroke幅を差し引いた穴）に収まる最大の矩形を毎回計算する。
 // 角の丸み（BR）も考慮するので、長辺・短辺・ベルト幅のスライダーをどう動かしても被らない。
-// 既定形状（長辺30m・短辺14m・ベルト幅1.5m）では理想サイズがそのまま収まる。
+// 既定形状（長辺38m・短辺6.5m・ベルト幅1.6m）のように短辺が狭い場合は、理想サイズより縮小される。
 const CHART_IDEAL_W = 410, CHART_IDEAL_H = 220;
 const CHART_MARGIN = 15; // ベルト内周からの安全マージン(px)
 
@@ -2150,7 +2150,7 @@ export default function BaggageSimulation() {
           <Slider label={`床仮置き一括処理閾値: ${floorBatchThreshold} 個`} min={1}    max={20}   step={1}     value={floorBatchThreshold} onChange={setFloorBatchThreshold} />
           <Slider label={`床仮置き積極化 ベルト数閾値: ${beltFloorTrigger} 個`} min={10} max={200} step={5} value={beltFloorTrigger} onChange={setBeltFloorTrigger} />
           <Slider label={`長辺長さ: ${beltLongSide}m`}                       min={10} max={40}  step={1}     value={beltLongSide}   onChange={setBeltLongSide} />
-          <Slider label={`短辺長さ: ${beltShortSide}m`}                      min={5}  max={25}  step={1}     value={beltShortSide}  onChange={setBeltShortSide} />
+          <Slider label={`短辺長さ: ${beltShortSide.toFixed(1)}m`}           min={5}  max={25}  step={0.5}   value={beltShortSide}  onChange={setBeltShortSide} />
           <Slider label={`ベルト幅: ${beltWidth.toFixed(1)}m`}               min={0.5} max={3.0} step={0.1}   value={beltWidth}      onChange={setBeltWidth} />
           <Slider label={`荷物長さ: ${bagLength.toFixed(2)}m`}               min={0.3} max={1.2} step={0.01}  value={bagLength}      onChange={setBagLength} />
           <Slider label={`荷物幅: ${bagWidth.toFixed(2)}m`}                 min={0.2} max={0.8} step={0.01}  value={bagWidth}       onChange={setBagWidth} />
