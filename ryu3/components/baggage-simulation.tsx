@@ -205,6 +205,7 @@ interface HistPt {
   done: number;
   queues: number[];
   spawned: number;
+  flights: number; // ベルト上にある荷物の行先便数（重複便名は1便として集計）
 }
 
 interface SimState {
@@ -769,6 +770,7 @@ function stepOnce(
       done: s.totalDone,
       queues: s.workers.map(w => w.queue.length + (w.current ? 1 : 0)),
       spawned: s.spawnedByDest.reduce((a, b) => a + b, 0),
+      flights: new Set(s.bags.filter(b => b.state === 'belt').map(b => b.destination)).size,
     });
   }
 }
@@ -794,6 +796,7 @@ interface ChartSeriesVisible {
   belt: boolean;
   spawned: boolean;
   done: boolean;
+  flights: boolean; // 行先便数（右軸）。投入量・処理済とは右軸を共有できないため排他表示
 }
 
 function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCapacity: number, outerLaneCapacity: number, visible: ChartSeriesVisible) {
@@ -825,8 +828,9 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
   const px = (t: number) => x + pad.l + ((t - startT) / spanT) * gw;
   const py = (v: number) => y + pad.t + gh - (v / maxAll) * gh;
 
-  // 右軸: 投入済み荷物量（累計・単調増加なので最終値を基準に上限を決める）
-  const rightMax = niceCeil(hist[hist.length - 1].spawned);
+  // 右軸: 「行先便数」選択時は便数（増減あり）の最大値、それ以外は投入済み荷物量（累計・単調増加なので最終値）を基準に上限を決める
+  const flightsMaxVal = hist.reduce((m, h) => Math.max(m, h.flights), 0);
+  const rightMax = visible.flights ? niceCeil(Math.max(1, flightsMaxVal)) : niceCeil(hist[hist.length - 1].spawned);
   const pyRight = (v: number) => y + pad.t + gh - (v / rightMax) * gh;
 
   const yTicks = [0, 50, 100, 150, 200, 250];
@@ -866,15 +870,25 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.strokeStyle = '#22C55E'; ctx.lineWidth = 1.8; ctx.stroke();
   }
 
-  // 内側レーン上限（オーバーフロー）ライン（赤・太線）= 外側上限 + 内側上限
+  // 行先便数（ベルト上にある荷物の行先の異なり数・右軸）ライン。同一行先便は1便として重複カウントしない。
+  if (visible.flights) {
+    ctx.beginPath();
+    hist.forEach((h, i) => {
+      const v = h.flights;
+      i === 0 ? ctx.moveTo(px(h.t), pyRight(v)) : ctx.lineTo(px(h.t), pyRight(v));
+    });
+    ctx.strokeStyle = '#FBBF24'; ctx.lineWidth = 1.8; ctx.stroke();
+  }
+
+  // 内側レーン上限（オーバーフロー）ライン（赤・太線・半透明）= 外側上限 + 内側上限
   const innerLineY = py(Math.min(outerLaneCapacity + innerLaneCapacity, maxAll));
   if (innerLineY >= y + pad.t && innerLineY <= y + pad.t + gh) {
     ctx.save();
-    ctx.strokeStyle = '#EF4444'; ctx.lineWidth = 2.5; ctx.setLineDash([]);
+    ctx.strokeStyle = 'rgba(239,68,68,0.5)'; ctx.lineWidth = 2.5; ctx.setLineDash([]);
     ctx.beginPath(); ctx.moveTo(x + pad.l, innerLineY); ctx.lineTo(x + w - pad.r, innerLineY); ctx.stroke();
     ctx.fillStyle = '#EF4444'; ctx.font = '14px sans-serif';
     ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
-    ctx.fillText(`上限: ${outerLaneCapacity + innerLaneCapacity}個`, x + pad.l + 2, innerLineY - 1);
+    ctx.fillText(`ベルト上の手荷物キャパ: ${outerLaneCapacity + innerLaneCapacity}個`, x + pad.l + 2, innerLineY - 1);
     ctx.restore();
   }
 
@@ -885,8 +899,8 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.fillText(tick === 0 ? '0' : `${tick}個`, x + pad.l - 3, py(tick));
   }
 
-  // Y-axis labels（右軸: 投入量・処理済。左軸と同じ目盛位置に対応する値を表示）
-  ctx.fillStyle = (visible.spawned || visible.done) ? '#94A3B8' : '#374151'; ctx.font = '12px sans-serif';
+  // Y-axis labels（右軸: 投入量・処理済 または 行先便数。左軸と同じ目盛位置に対応する値を表示）
+  ctx.fillStyle = (visible.spawned || visible.done || visible.flights) ? '#94A3B8' : '#374151'; ctx.font = '12px sans-serif';
   ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
   for (const tick of yTicks) {
     const v = Math.round((tick / maxAll) * rightMax);
@@ -932,16 +946,21 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
   ctx.fillStyle = visible.belt ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
   ctx.fillText(legLabel1, legLx + 20, legLy1);
 
-  const legLabel2 = '投入量（右軸）';
-  ctx.fillStyle = visible.spawned ? '#C084FC' : '#374151'; ctx.fillRect(legLx, legLy2, 16, 8);
-  ctx.fillStyle = visible.spawned ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
+  // 「行先便数」選択時は投入量・処理済の代わりに行先便数を2段目に表示する（右軸を共有できないため排他）
+  const legLabel2 = visible.flights ? '行先便数（右軸）' : '投入量（右軸）';
+  const legLabel2Active = visible.flights || visible.spawned;
+  const legLabel2Color = visible.flights ? '#FBBF24' : '#C084FC';
+  ctx.fillStyle = legLabel2Active ? legLabel2Color : '#374151'; ctx.fillRect(legLx, legLy2, 16, 8);
+  ctx.fillStyle = legLabel2Active ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
   ctx.fillText(legLabel2, legLx + 20, legLy2);
 
-  const legLx3 = legLx + ctx.measureText(legLabel2).width + 30;
-  const legLabel3 = '処理済（右軸）';
-  ctx.fillStyle = visible.done ? '#22C55E' : '#374151'; ctx.fillRect(legLx3, legLy2, 16, 8);
-  ctx.fillStyle = visible.done ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
-  ctx.fillText(legLabel3, legLx3 + 20, legLy2);
+  if (!visible.flights) {
+    const legLx3 = legLx + ctx.measureText(legLabel2).width + 30;
+    const legLabel3 = '処理済（右軸）';
+    ctx.fillStyle = visible.done ? '#22C55E' : '#374151'; ctx.fillRect(legLx3, legLy2, 16, 8);
+    ctx.fillStyle = visible.done ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
+    ctx.fillText(legLabel3, legLx3 + 20, legLy2);
+  }
 }
 
 // ── Stats panel drawn on offscreen canvas (right side of recording) ──
@@ -1383,9 +1402,18 @@ export default function BaggageSimulation() {
   );
   const [clockwise, setClockwise] = useState(false);
   const [injectionRuleId, setInjectionRuleId] = useState<string>(INJECTION_RULES[0].id);
-  const [chartSeriesVisible, setChartSeriesVisible] = useState<ChartSeriesVisible>({ belt: true, spawned: true, done: true });
+  const [chartSeriesVisible, setChartSeriesVisible] = useState<ChartSeriesVisible>({ belt: true, spawned: true, done: true, flights: false });
   const toggleChartSeries = (key: keyof ChartSeriesVisible) => {
-    setChartSeriesVisible(prev => ({ ...prev, [key]: !prev[key] }));
+    setChartSeriesVisible(prev => {
+      if (key === 'flights') {
+        // 行先便数は投入量・処理済と右軸を共有できないため、ONにする際は両方OFFにする
+        const next = !prev.flights;
+        return { ...prev, flights: next, spawned: next ? false : prev.spawned, done: next ? false : prev.done };
+      }
+      // 行先便数がON中は投入量・処理済を選択できない
+      if (prev.flights && (key === 'spawned' || key === 'done')) return prev;
+      return { ...prev, [key]: !prev[key] };
+    });
   };
   // 「エクセル読み込み」ルール用の状態
   // フォーマット: A列=便名（2行目以降）、C列以降=5分刻みの時間帯ごとの投入数（2行目以降）
@@ -1479,7 +1507,7 @@ export default function BaggageSimulation() {
   const [stats, setStats] = useState<{
     id: number; q: number; floor: number; done: number; floorDone: number;
   }[]>([]);
-  const [overlayStats, setOverlayStats] = useState<{ time: number; spawned: number; belt: number; done: number; floor: number; totalFloor: number; overflow: number; firstOuterExceedTime: number | null; firstOverflowTime: number | null; emergencyStopCount: number; emergencyStopTotalTime: number }>({ time: 0, spawned: 0, belt: 0, done: 0, floor: 0, totalFloor: 0, overflow: 0, firstOuterExceedTime: null, firstOverflowTime: null, emergencyStopCount: 0, emergencyStopTotalTime: 0 });
+  const [overlayStats, setOverlayStats] = useState<{ time: number; spawned: number; belt: number; done: number; floor: number; totalFloor: number; overflow: number; firstOuterExceedTime: number | null; firstOverflowTime: number | null; emergencyStopCount: number; emergencyStopTotalTime: number; flightsOnBelt: number; totalFlights: number }>({ time: 0, spawned: 0, belt: 0, done: 0, floor: 0, totalFloor: 0, overflow: 0, firstOuterExceedTime: null, firstOverflowTime: null, emergencyStopCount: 0, emergencyStopTotalTime: 0, flightsOnBelt: 0, totalFlights: 0 });
   const [isEmergencyStop, setIsEmergencyStop] = useState(false);
 
   const initSim = useCallback(() => {
@@ -1585,6 +1613,9 @@ export default function BaggageSimulation() {
         firstOverflowTime: displayState.firstOverflowTime,
         emergencyStopCount: displayState.emergencyStopCount,
         emergencyStopTotalTime: displayState.emergencyStopTotalTime,
+        // 便数は同一行先を1便として重複カウントしない
+        flightsOnBelt: new Set(displayState.bags.filter(b => b.state === 'belt').map(b => b.destination)).size,
+        totalFlights: new Set(displayState.workers.flatMap(w => w.assignedDests)).size,
       });
       setIsEmergencyStop(displayState.emergencyStop);
     };
@@ -1695,6 +1726,8 @@ export default function BaggageSimulation() {
       firstOverflowTime: snap.firstOverflowTime,
       emergencyStopCount: snap.emergencyStopCount,
       emergencyStopTotalTime: snap.emergencyStopTotalTime,
+      flightsOnBelt: new Set(snap.bags.filter(b => b.state === 'belt').map(b => b.destination)).size,
+      totalFlights: new Set(snap.workers.flatMap(w => w.assignedDests)).size,
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
@@ -1858,6 +1891,7 @@ export default function BaggageSimulation() {
             <div className="text-gray-200" style={{ fontSize: '14px' }}>ベルト上の荷物: {overlayStats.belt} 個</div>
             <div className="text-gray-200" style={{ fontSize: '14px' }}>処理済: {overlayStats.done} 個</div>
             <div className="text-gray-200" style={{ fontSize: '14px' }}>床仮置き: {overlayStats.floor} 個 / 累計: {overlayStats.totalFloor} 個</div>
+            <div className="text-gray-200" style={{ fontSize: '14px' }}>ベルト上便数: {overlayStats.flightsOnBelt} 便 / 総便数: {overlayStats.totalFlights} 便</div>
             <div style={{ fontSize: '14px', color: overlayStats.overflow > 0 ? '#FB923C' : '#E5E7EB' }}>
               オーバーフロー: {overlayStats.overflow} 個
             </div>
@@ -1933,15 +1967,23 @@ export default function BaggageSimulation() {
               </button>
               <button
                 onClick={() => toggleChartSeries('spawned')}
-                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.spawned ? 'bg-purple-600 border-purple-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
+                disabled={chartSeriesVisible.flights}
+                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.flights ? 'bg-gray-900 border-gray-800 text-gray-700 cursor-not-allowed' : chartSeriesVisible.spawned ? 'bg-purple-600 border-purple-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
               >
                 投入量
               </button>
               <button
                 onClick={() => toggleChartSeries('done')}
-                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.done ? 'bg-green-600 border-green-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
+                disabled={chartSeriesVisible.flights}
+                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.flights ? 'bg-gray-900 border-gray-800 text-gray-700 cursor-not-allowed' : chartSeriesVisible.done ? 'bg-green-600 border-green-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
               >
                 処理済
+              </button>
+              <button
+                onClick={() => toggleChartSeries('flights')}
+                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.flights ? 'bg-amber-500 border-amber-300 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
+              >
+                行先便数
               </button>
             </div>
           </div>
