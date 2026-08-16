@@ -17,6 +17,7 @@ const PIXELS_PER_METER = 20;
 const DEFAULT_BELT_WIDTH_M = 1.6; // meters
 const BCX = 410, BCY = 230;
 const WORKER_OFFSET = 45;
+const WORKER_MIN_GAP_PX = 60; // 同じ辺に並ぶ作業者アイコン（直径約40px、発光エフェクト込みで見た目はもう少し大きい）同士の最低間隔(px, 等倍時)
 
 // ── 作業者人数 ────────────────────────────────────────────────
 const DEFAULT_WORKER_COUNT = 4;
@@ -26,11 +27,15 @@ const MAX_WORKERS = 100;
 // （5人目は再び下辺、6人目は上辺…というように便数に応じて作業Noを増やしながら巡回する）
 // t=0が上辺中央、t=0.25が右辺中央、t=0.5が下辺中央、t=0.75が左辺中央になる
 // （beltInfoの円周パラメータ化の対称性により、ベルトの縦横比によらず常にこの位置になる）。
-const WORKER_EDGE_ORDER: { center: number; lengthKey: 'W_IN' | 'H_IN' }[] = [
-  { center: 0.5,  lengthKey: 'W_IN' }, // 下辺
-  { center: 0.0,  lengthKey: 'W_IN' }, // 上辺
-  { center: 0.25, lengthKey: 'H_IN' }, // 右辺
-  { center: 0.75, lengthKey: 'H_IN' }, // 左辺
+// 右辺・左辺はアイコンが密集しやすいため最大2名までとし、それを超える分は上辺・下辺
+// （人数制限なし）に振り分ける。上辺・下辺が交互に埋まるので、なるべく均等に広がり
+// アイコン同士が被りにくくなる。
+const QUADRANT_FRAC = 0.25; // 隣り合う辺の中心同士は常にちょうど周長の1/4離れている（上記の対称性より）
+const WORKER_EDGE_ORDER: { center: number; lengthKey: 'W_IN' | 'H_IN'; capacity: number }[] = [
+  { center: 0.5,  lengthKey: 'W_IN', capacity: Infinity }, // 下辺（人数制限なし）
+  { center: 0.0,  lengthKey: 'W_IN', capacity: Infinity }, // 上辺（人数制限なし）
+  { center: 0.25, lengthKey: 'H_IN', capacity: 2 },        // 右辺（最大2名）
+  { center: 0.75, lengthKey: 'H_IN', capacity: 2 },        // 左辺（最大2名）
 ];
 function generateWorkerPositions(n: number, beltLongSideM: number, beltShortSideM: number): number[] {
   const BW = beltLongSideM * PIXELS_PER_METER;
@@ -42,17 +47,32 @@ function generateWorkerPositions(n: number, beltLongSideM: number, beltShortSide
   const PERIM = 2 * W_IN + 2 * H_IN + 4 * CORNER;
   const edgeLength = { W_IN, H_IN };
 
-  // 下辺→上辺→右辺→左辺の順に1人ずつ巡回して割り当てる
+  // 下辺→上辺→右辺→左辺の順に1人ずつ巡回して割り当てる。定員に達した辺は飛ばして次の辺に回す
+  // （右辺・左辺が2名で埋まった後は、残りは自動的に上辺・下辺のみを交互に巡回する）。
   const edgeAssign: number[][] = WORKER_EDGE_ORDER.map(() => []);
-  for (let i = 0; i < n; i++) edgeAssign[i % 4].push(i);
+  let edgeIdx = 0;
+  for (let i = 0; i < n; i++) {
+    for (let skip = 0; edgeAssign[edgeIdx % 4].length >= WORKER_EDGE_ORDER[edgeIdx % 4].capacity && skip < 4; skip++) {
+      edgeIdx++;
+    }
+    edgeAssign[edgeIdx % 4].push(i);
+    edgeIdx++;
+  }
 
   const positions = new Array(n).fill(0);
   WORKER_EDGE_ORDER.forEach((edge, ei) => {
     const idxs = edgeAssign[ei];
     const count = idxs.length;
     if (count === 0) return;
-    // コーナー付近を避けるため辺の中央80%だけを使って均等配置する
-    const usableLenFrac = (edgeLength[edge.lengthKey] * 0.8) / PERIM;
+    const edgeLenFrac = edgeLength[edge.lengthKey] / PERIM;
+    // コーナー付近を避けるため辺の中央80%を基本にしつつ、短い辺（右辺・左辺など）で
+    // アイコン（直径約40px）同士が被ってしまう場合は、被らない最低限の間隔を確保できる
+    // 幅まで広げる。t=0/0.25/0.5/0.75の対称性により、隣の辺の中心までは常にちょうど
+    // 周長の1/4離れているため、そこへ食い込みすぎない範囲（1/4の約90%）を上限にする。
+    const naturalSpanFrac = edgeLenFrac * 0.8;
+    // 隣接アイコン間の間隔を WORKER_MIN_GAP_PX 以上にするための幅（隣接ギャップ = usableLenFrac/count * PERIM）
+    const neededSpanFrac = count > 1 ? (WORKER_MIN_GAP_PX * count) / PERIM : 0;
+    const usableLenFrac = Math.min(Math.max(naturalSpanFrac, neededSpanFrac), QUADRANT_FRAC * 1.8);
     idxs.forEach((workerIdx, slot) => {
       const frac = count === 1 ? 0.5 : (slot + 0.5) / count;
       const offset = (frac - 0.5) * usableLenFrac;
@@ -164,12 +184,15 @@ function getInjectionRule(id: string): InjectionRule {
 // グラフはベルトの下に配置する。ベルトの長辺・短辺・幅や作業者配置がどんな値でも、
 // シーン全体（ベルト＋作業者マージン＋寸法線＋グラフ）を一括で「今の枠」ぎりぎりに
 // 縮小し、絶対にキャンバスからはみ出さないようにする（拡大はしない＝scaleは最大1）。
+// SCENE_OUTER_MARGIN 分の余白を必ず残すことで、要素がキャンバスの枠線に触れて
+// 被って見えることがないようにする。
 const SCENE_MARGIN_SIDE = 100;        // ベルト左右の作業者・統計ボックス用マージン(px, 等倍時)
 const SCENE_MARGIN_TOP = 100;         // ベルト上の作業者用マージン(px, 等倍時)
 const SCENE_MARGIN_BOTTOM_BELT = 100; // ベルト下・寸法線より上の作業者用マージン(px, 等倍時)
-const DIM_LABEL_H = 40;               // 長辺寸法線＋テキストの高さ(px, 等倍時)
-const CHART_GAP = 16;                 // 寸法表示とグラフの間隔(px, 等倍時)
-const CHART_NATURAL_W = 410, CHART_NATURAL_H = 190; // グラフの理想サイズ(px, 等倍時)
+const CHART_GAP = 16;                 // ベルト下マージンとグラフの間隔(px, 等倍時)。寸法線・テキストは
+                                       // SCENE_MARGIN_BOTTOM_BELT内に収まっているので、被らない最小限の間隔でよい。
+const CHART_NATURAL_W = 820;          // グラフの理想幅(px, 等倍時)
+const SCENE_OUTER_MARGIN = 14;        // シーン全体とキャンバス枠線との間に必ず確保する余白(px, 等倍時)
 
 interface SceneLayout {
   scale: number;
@@ -177,6 +200,7 @@ interface SceneLayout {
   boxLeft: number; boxRight: number; boxTop: number; beltAreaBottom: number; // 等倍座標系でのクランプ用境界
   chart: { x: number; y: number; w: number; h: number };      // 等倍座標系でのグラフ矩形（canvas描画用）
   chartFinal: { x: number; y: number; w: number; h: number }; // 変換後の実キャンバス座標系でのグラフ矩形（DOMオーバーレイ配置用）
+  beltCenterFinal: { x: number; y: number }; // 変換後の実キャンバス座標系でのベルト中央（DOMオーバーレイ配置用）
 }
 
 function computeSceneLayout(beltW: number, beltH: number): SceneLayout {
@@ -185,25 +209,36 @@ function computeSceneLayout(beltW: number, beltH: number): SceneLayout {
   const boxRight = BCX + groupW / 2;
   const boxTop = BCY - beltH / 2 - SCENE_MARGIN_TOP;
   const beltAreaBottom = BCY + beltH / 2 + SCENE_MARGIN_BOTTOM_BELT;
-  const chartX = BCX - CHART_NATURAL_W / 2;
-  const chartY = beltAreaBottom + DIM_LABEL_H + CHART_GAP;
-  const boxBottom = chartY + CHART_NATURAL_H;
+  // 左右位置はシーン枠の左端ぎりぎりに寄せる。縦位置・縦サイズは、ベルト下マージンのすぐ下から
+  // ベルト＋作業者マージン全体と同じ高さ（beltAreaBottom - boxTop）まで拡張する＝上側のベルトと
+  // 被らない範囲で最大限のサイズになる。ベルト形状が変わっても自動追従する。
+  const chartX = boxLeft;
+  const chartY = beltAreaBottom + CHART_GAP;
+  const chartH = beltAreaBottom - boxTop;
+  const boxBottom = chartY + chartH;
   const groupH = boxBottom - boxTop;
 
-  const scale = Math.min(SW / groupW, SH / groupH, 1);
-  const tx = (SW - groupW * scale) / 2 - boxLeft * scale;
+  // 枠線ぎりぎりに要素が触れないよう、キャンバスの実寸から余白を差し引いた領域に収める。
+  // 横方向は中央寄せではなく左端をSCENE_OUTER_MARGINに固定する（＝グラフが常に左枠ぎりぎりに
+  // 寄るようにする。高さ側が縮小のボトルネックになる形状では、中央寄せだと余白が左右に分散して
+  // グラフが枠の左端から離れてしまうため）。縦方向は従来通り中央寄せのまま。
+  const availW = SW - SCENE_OUTER_MARGIN * 2;
+  const availH = SH - SCENE_OUTER_MARGIN * 2;
+  const scale = Math.min(availW / groupW, availH / groupH, 1);
+  const tx = SCENE_OUTER_MARGIN - boxLeft * scale;
   const ty = (SH - groupH * scale) / 2 - boxTop * scale;
 
   return {
     scale, tx, ty,
     boxLeft, boxRight, boxTop, beltAreaBottom,
-    chart: { x: chartX, y: chartY, w: CHART_NATURAL_W, h: CHART_NATURAL_H },
+    chart: { x: chartX, y: chartY, w: CHART_NATURAL_W, h: chartH },
     chartFinal: {
       x: tx + chartX * scale,
       y: ty + chartY * scale,
       w: CHART_NATURAL_W * scale,
-      h: CHART_NATURAL_H * scale,
+      h: chartH * scale,
     },
+    beltCenterFinal: { x: tx + BCX * scale, y: ty + BCY * scale },
   };
 }
 
@@ -850,7 +885,7 @@ interface ChartSeriesVisible {
 
 function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCapacity: number, outerLaneCapacity: number, visible: ChartSeriesVisible, rect: { x: number; y: number; w: number; h: number }) {
   const { x, y, w, h } = rect;
-  const pad = { l: 52, r: 44, t: 42, b: 32 };
+  const pad = { l: 52, r: 44, t: 48, b: 32 };
   const gw = w - pad.l - pad.r;
   const gh = h - pad.t - pad.b;
 
@@ -861,7 +896,7 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
 
   const hist = s.hist;
   if (hist.length < 2) {
-    ctx.fillStyle = '#4B5563'; ctx.font = '22px sans-serif';
+    ctx.fillStyle = '#4B5563'; ctx.font = '28px sans-serif';
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText('データ収集中...', x + w / 2, y + h / 2);
     return;
@@ -938,7 +973,7 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
       ctx.save();
       ctx.strokeStyle = 'rgba(239,68,68,0.5)'; ctx.lineWidth = 2.5; ctx.setLineDash([]);
       ctx.beginPath(); ctx.moveTo(x + pad.l, innerLineY); ctx.lineTo(x + w - pad.r, innerLineY); ctx.stroke();
-      ctx.fillStyle = '#EF4444'; ctx.font = '14px sans-serif';
+      ctx.fillStyle = '#EF4444'; ctx.font = '20px sans-serif';
       ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
       ctx.fillText(`ベルト上の手荷物キャパ: ${laneCapacityTotal}個`, x + pad.l + 2, innerLineY - 1);
       ctx.restore();
@@ -946,18 +981,20 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
   }
 
   // Y-axis labels（左軸: ベルト上の荷物。文字色は「ベルト上の荷物」の線と同じ青）
-  ctx.fillStyle = visible.belt ? '#3B82F6' : '#374151'; ctx.font = '14px sans-serif';
+  ctx.fillStyle = visible.belt ? '#3B82F6' : '#374151'; ctx.font = '20px sans-serif';
   ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
   for (const tick of yTicks) {
     ctx.fillText(tick === 0 ? '0' : `${tick}個`, x + pad.l - 3, py(tick));
   }
 
   // Y-axis labels（右軸: 投入量・処理済 または 行先便数。左軸と同じ目盛位置に対応する値を表示）
-  ctx.fillStyle = (visible.spawned || visible.done || visible.flights) ? '#94A3B8' : '#374151'; ctx.font = '12px sans-serif';
+  // 単位は左軸と同様の付け方（0のときは単位なし）: 投入量・処理済は「個」、行先便数は「便」
+  const rightUnit = visible.flights ? '便' : '個';
+  ctx.fillStyle = (visible.spawned || visible.done || visible.flights) ? '#94A3B8' : '#374151'; ctx.font = '18px sans-serif';
   ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
   for (const tick of yTicks) {
     const v = Math.round((tick / maxAll) * rightMax);
-    ctx.fillText(v === 0 ? '0' : `${v.toLocaleString()}`, x + w - pad.r + 4, py(tick));
+    ctx.fillText(v === 0 ? '0' : `${v.toLocaleString()}${rightUnit}`, x + w - pad.r + 4, py(tick));
   }
 
   // X-axis time ticks (minutes)
@@ -969,7 +1006,7 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
   else if (totalMinutes <= 30) tickIntervalSec = 300;
   else tickIntervalSec = 600;
 
-  ctx.font = '12px sans-serif';
+  ctx.font = '18px sans-serif';
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
   let xt = 0;
   while (xt <= endT + tickIntervalSec * 0.01) {
@@ -990,9 +1027,9 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
   // Legend（1段目: 左軸の系列 / 2段目: 右軸の系列）
   const legLx = x + pad.l;
   const legLy1 = y + 6;
-  const legLy2 = legLy1 + 14;
+  const legLy2 = legLy1 + 20;
   ctx.textBaseline = 'top';
-  ctx.font = '12px sans-serif';
+  ctx.font = '18px sans-serif';
 
   const legLabel1 = 'ベルト上の荷物（左軸）';
   ctx.fillStyle = visible.belt ? '#3B82F6' : '#374151'; ctx.fillRect(legLx, legLy1, 16, 8);
@@ -1205,6 +1242,10 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
   }) : null;
   const bottleneckQueue = bottleneck ? bottleneck.queue.length + (bottleneck.current ? 1 : 0) : 0;
 
+  // 作業者の「済/床」枠は全員のアイコン描画後にまとめて描く（後で描かれる別作業者のアイコンに
+  // 枠が隠れてしまわないよう、枠を常に最前面にするため）
+  const drawStatsBoxes: (() => void)[] = [];
+
   // Draw workers（「エクセル読み込み」ルールで担当便の荷物が投入されていない/投入完了した作業者は非表示）
   for (const w of workers) {
     if (!w.visible) continue;
@@ -1280,8 +1321,9 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
           drawX = wx - 33 - col * 13;
           drawY = wy + row * 11 - 11;
         } else {
-          // 右辺・左辺: 少し下に横3個ずつの行で配置
-          const pileCy = wy + 55;
+          // 右辺・左辺: 作業者アイコン（円半径20px＋処理中の輪の半径22px）の真下、
+          // ギリギリ被らない位置に詰めて横3個ずつの行で配置
+          const pileCy = wy + 33;
           drawX = wx + (fi % 3) * 13 - 13;
           drawY = pileCy + Math.floor(fi / 3) * 11 - 4;
         }
@@ -1296,7 +1338,7 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
       }
       const totalFloorCount = (w.activeFloor ? 1 : 0) + w.floorQueue.length;
       const labelX = isVerticalWorkerForFloor ? wx - 33 - Math.floor((totalFloorCount - 1) / 3) * 13 : wx;
-      const labelY = isVerticalWorkerForFloor ? wy + 22 : wy + 75;
+      const labelY = isVerticalWorkerForFloor ? wy + 22 : wy + 53;
       ctx.fillStyle = '#FEF3C7'; ctx.font = 'bold 10px sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.fillText(`床:${totalFloorCount}`, labelX, labelY);
@@ -1322,8 +1364,9 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
 
     let statsX: number, statsY: number;
     const boxW = compact ? 62 : 90;
-    const boxH = compact ? 24 : 30;
-    const fontSize = compact ? 10 : 13;
+    const boxH = compact ? 34 : 40;
+    const fontSize = compact ? 14 : 17;
+    const lineOffset = fontSize / 2 + 1; // 「済」「床」2行がフォントサイズに応じて被らないようにする縦オフセット
     const line1 = `済 ${totalDone}/${totalAssigned}`;
     const line2 = `床 ${floorActive}個`;
 
@@ -1343,22 +1386,27 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
       statsY = Math.max(layout.boxTop + boxH / 2 + 3, wy - 30 - boxH / 2);
     }
 
-    ctx.fillStyle = 'rgba(17,24,39,0.9)';
-    ctx.beginPath();
-    ctx.roundRect(statsX - boxW / 2, statsY - boxH / 2, boxW, boxH, 5);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(75,85,99,0.7)'; ctx.lineWidth = 0.8;
-    ctx.beginPath();
-    ctx.roundRect(statsX - boxW / 2, statsY - boxH / 2, boxW, boxH, 5);
-    ctx.stroke();
+    drawStatsBoxes.push(() => {
+      ctx.fillStyle = 'rgba(17,24,39,0.9)';
+      ctx.beginPath();
+      ctx.roundRect(statsX - boxW / 2, statsY - boxH / 2, boxW, boxH, 5);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(75,85,99,0.7)'; ctx.lineWidth = 0.8;
+      ctx.beginPath();
+      ctx.roundRect(statsX - boxW / 2, statsY - boxH / 2, boxW, boxH, 5);
+      ctx.stroke();
 
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.font = `bold ${fontSize}px sans-serif`;
-    ctx.fillStyle = '#86EFAC';
-    ctx.fillText(line1, statsX, statsY - 6);
-    ctx.fillStyle = '#FCA5A5';
-    ctx.fillText(line2, statsX, statsY + 7);
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = `bold ${fontSize}px sans-serif`;
+      ctx.fillStyle = '#86EFAC';
+      ctx.fillText(line1, statsX, statsY - lineOffset);
+      ctx.fillStyle = '#FCA5A5';
+      ctx.fillText(line2, statsX, statsY + lineOffset);
+    });
   }
+
+  // 全作業者アイコンの描画が終わってから「済/床」枠を最前面に描画する
+  for (const draw of drawStatsBoxes) draw();
 
   // Bags on belt
   const laneOffset = s.beltWidthPx / 4;
@@ -1936,18 +1984,19 @@ export default function BaggageSimulation() {
             className="block w-full"
             style={{ aspectRatio: `${SW}/${SH}` }}
           />
-          {/* 緊急停止ポップアップ（グラフ内オーバーフロー表記の真上） */}
+          {/* 緊急停止ポップアップ（ベルトが囲む中央の空きスペースに表示） */}
           {isEmergencyStop && (
             <div
               className="absolute flex items-center gap-1 bg-red-700/90 text-white rounded px-2 py-0.5 border border-red-400 font-bold whitespace-nowrap"
               style={{
-                bottom: `${((SH - sceneLayout.chartFinal.y) / SH * 100).toFixed(1)}%`,
-                right: `${((SW - sceneLayout.chartFinal.x - sceneLayout.chartFinal.w + 8) / SW * 100).toFixed(1)}%`,
+                left: `${(sceneLayout.beltCenterFinal.x / SW * 100).toFixed(1)}%`,
+                top: `${(sceneLayout.beltCenterFinal.y / SH * 100).toFixed(1)}%`,
+                transform: 'translate(-50%, -50%)',
                 fontSize: '11px',
                 zIndex: 10,
               }}
             >
-              🚨 緊急停止、荷物床置き中
+              🚨 緊急停止、荷物床置き＆積み込み中
             </div>
           )}
 
