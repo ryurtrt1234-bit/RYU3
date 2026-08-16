@@ -17,6 +17,13 @@ const PIXELS_PER_METER = 20;
 const DEFAULT_BELT_WIDTH_M = 1.6; // meters
 const BCX = 410, BCY = 230;
 const WORKER_OFFSET = 45;
+// ベルト中央に表示する「便数・作業者数」テキスト（太字40px）の概算半分の高さ(px, 等倍時)。
+// 緊急停止ポップアップをこの上側に配置する際の被り判定に使う。
+const BELT_CENTER_INFO_HALF_HEIGHT = 22;
+// 緊急停止ポップアップ(DOM要素)の概算半分の高さ(px, 等倍時)
+const EMERGENCY_POPUP_HALF_HEIGHT = 11;
+// 緊急停止ポップアップと便数・作業者数テキストとの最低間隔(px, 等倍時)
+const EMERGENCY_POPUP_GAP_Y = 3;
 const WORKER_MIN_GAP_PX = 60; // 同じ辺に並ぶ作業者アイコン（直径約40px、発光エフェクト込みで見た目はもう少し大きい）同士の最低間隔(px, 等倍時)
 
 // ── 作業者人数 ────────────────────────────────────────────────
@@ -201,9 +208,10 @@ interface SceneLayout {
   chart: { x: number; y: number; w: number; h: number };      // 等倍座標系でのグラフ矩形（canvas描画用）
   chartFinal: { x: number; y: number; w: number; h: number }; // 変換後の実キャンバス座標系でのグラフ矩形（DOMオーバーレイ配置用）
   beltCenterFinal: { x: number; y: number }; // 変換後の実キャンバス座標系でのベルト中央（DOMオーバーレイ配置用）
+  emergencyPopupFinal: { x: number; y: number }; // 緊急停止ポップアップの表示位置（ベルト中央の便数・作業者数表示の真上、被らない位置）
 }
 
-function computeSceneLayout(beltW: number, beltH: number): SceneLayout {
+function computeSceneLayout(beltW: number, beltH: number, beltWidthPx: number): SceneLayout {
   const groupW = Math.max(beltW + SCENE_MARGIN_SIDE * 2, CHART_NATURAL_W);
   const boxLeft = BCX - groupW / 2;
   const boxRight = BCX + groupW / 2;
@@ -228,6 +236,14 @@ function computeSceneLayout(beltW: number, beltH: number): SceneLayout {
   const tx = SCENE_OUTER_MARGIN - boxLeft * scale;
   const ty = (SH - groupH * scale) / 2 - boxTop * scale;
 
+  // 緊急停止ポップアップは、ベルト中央の「便数・作業者数」テキストの真上、被らない位置に配置する。
+  // ベルトが内側に囲む空きスペースの縦方向の半分の高さ（＝トラック内周までの距離）を超えない
+  // 範囲でギリギリ収まるよう、ベルトの短辺・幅に応じてオフセットをクランプする。
+  const innerHalfHeight = beltH / 2 - beltWidthPx / 2;
+  const clearOffsetY = BELT_CENTER_INFO_HALF_HEIGHT + EMERGENCY_POPUP_GAP_Y + EMERGENCY_POPUP_HALF_HEIGHT;
+  const maxFitOffsetY = innerHalfHeight - EMERGENCY_POPUP_HALF_HEIGHT;
+  const emergencyOffsetY = Math.max(20, Math.min(clearOffsetY, maxFitOffsetY));
+
   return {
     scale, tx, ty,
     boxLeft, boxRight, boxTop, beltAreaBottom,
@@ -239,6 +255,7 @@ function computeSceneLayout(beltW: number, beltH: number): SceneLayout {
       h: chartH * scale,
     },
     beltCenterFinal: { x: tx + BCX * scale, y: ty + BCY * scale },
+    emergencyPopupFinal: { x: tx + BCX * scale, y: ty + (BCY - emergencyOffsetY) * scale },
   };
 }
 
@@ -997,14 +1014,23 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.fillText(v === 0 ? '0' : `${v.toLocaleString()}${rightUnit}`, x + w - pad.r + 4, py(tick));
   }
 
-  // X-axis time ticks (minutes)
+  // X-axis time ticks（開始から60分を超えたら単位を「分」から「時間」表示に切り替える）
   const totalMinutes = endT / 60;
+  const useHourUnit = totalMinutes > 60;
   let tickIntervalSec: number;
-  if (totalMinutes <= 2) tickIntervalSec = 30;
-  else if (totalMinutes <= 5) tickIntervalSec = 60;
-  else if (totalMinutes <= 15) tickIntervalSec = 120;
-  else if (totalMinutes <= 30) tickIntervalSec = 300;
-  else tickIntervalSec = 600;
+  if (!useHourUnit) {
+    if (totalMinutes <= 2) tickIntervalSec = 30;
+    else if (totalMinutes <= 5) tickIntervalSec = 60;
+    else if (totalMinutes <= 15) tickIntervalSec = 120;
+    else if (totalMinutes <= 30) tickIntervalSec = 300;
+    else tickIntervalSec = 600;
+  } else {
+    const totalHours = totalMinutes / 60;
+    if (totalHours <= 3) tickIntervalSec = 1800;       // 30分刻み
+    else if (totalHours <= 8) tickIntervalSec = 3600;  // 1時間刻み
+    else if (totalHours <= 16) tickIntervalSec = 7200; // 2時間刻み
+    else tickIntervalSec = 14400;                      // 4時間刻み
+  }
 
   ctx.font = '18px sans-serif';
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
@@ -1018,8 +1044,16 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
       ctx.beginPath(); ctx.moveTo(gx, y + pad.t); ctx.lineTo(gx, y + pad.t + gh); ctx.stroke();
       ctx.setLineDash([]);
       ctx.fillStyle = '#64748B';
-      const mins = Math.round(xt / 60);
-      ctx.fillText(xt === 0 ? '0分' : `${mins}分`, gx, y + pad.t + gh + 3);
+      let label: string;
+      if (xt === 0) {
+        label = useHourUnit ? '0時間' : '0分';
+      } else if (useHourUnit) {
+        const hours = xt / 3600;
+        label = `${Number.isInteger(hours) ? hours : hours.toFixed(1)}時間`;
+      } else {
+        label = `${Math.round(xt / 60)}分`;
+      }
+      ctx.fillText(label, gx, y + pad.t + gh + 3);
     }
     xt += tickIntervalSec;
   }
@@ -1134,13 +1168,13 @@ function drawStatsPanel(ctx: CanvasRenderingContext2D, s: SimState, simSpeed: nu
 
 // ── Draw simulation canvas ───────────────────────────────────
 function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean, chartSeriesVisible: ChartSeriesVisible) {
-  const { workers, bags, beltW: BW, beltH: BH, beltR: BR } = s;
+  const { workers, bags, beltW: BW, beltH: BH, beltR: BR, beltWidthPx } = s;
 
   ctx.fillStyle = '#111827';
   ctx.fillRect(0, 0, SW, SH);
 
   // ベルト＋作業者＋グラフ（ベルト下）をキャンバス枠に収める一括縮小変換
-  const layout = computeSceneLayout(BW, BH);
+  const layout = computeSceneLayout(BW, BH, beltWidthPx);
   ctx.save();
   ctx.translate(layout.tx, layout.ty);
   ctx.scale(layout.scale, layout.scale);
@@ -1161,6 +1195,14 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
   // Belt dashed center line
   roundRectPath(ctx, bx, by, BW, BH, BR);
   ctx.strokeStyle = '#4B5563'; ctx.lineWidth = 1.5; ctx.setLineDash([6, 8]); ctx.stroke(); ctx.setLineDash([]);
+
+  // ベルト内側の空きスペースに、ベルト上を流れている行先便数（重複便名は1便として数える）と、
+  // 現在稼働中（表示中）の作業者数をリアルタイムに表示する。作業者数は便数の右側に並べる。
+  const flightsOnBeltNow = new Set(bags.filter(b => b.state === 'belt').map(b => b.destination)).size;
+  const activeWorkerCountNow = workers.filter(w => w.visible).length;
+  ctx.fillStyle = '#E5E7EB'; ctx.font = 'bold 40px sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(`${flightsOnBeltNow}便　${activeWorkerCountNow}名`, BCX, BCY);
 
   // Belt direction arrows
   for (let i = 0; i < 10; i++) {
@@ -1492,7 +1534,7 @@ export default function BaggageSimulation() {
   const [beltWidth, setBeltWidth]         = useState(DEFAULT_BELT_WIDTH_M);
   // シーン全体（ベルト＋作業者＋グラフ）のレイアウト（緊急停止ポップアップの表示位置に使用。
   // 実際の描画は canvas 側の drawSim/drawInlineChart が同じ関数で毎回計算する）
-  const sceneLayout = computeSceneLayout(beltLongSide * PIXELS_PER_METER, beltShortSide * PIXELS_PER_METER);
+  const sceneLayout = computeSceneLayout(beltLongSide * PIXELS_PER_METER, beltShortSide * PIXELS_PER_METER, beltWidth * PIXELS_PER_METER);
   const [bagLength, setBagLength]         = useState(DEFAULT_BAG_L);
   const [bagWidth, setBagWidth]           = useState(DEFAULT_BAG_W);
   const [beltSpeedMS, setBeltSpeedMS]     = useState(0.4);
@@ -1984,13 +2026,13 @@ export default function BaggageSimulation() {
             className="block w-full"
             style={{ aspectRatio: `${SW}/${SH}` }}
           />
-          {/* 緊急停止ポップアップ（ベルトが囲む中央の空きスペースに表示） */}
+          {/* 緊急停止ポップアップ（ベルト中央の「便数・作業者数」表示の真上、被らない位置に表示。ベルト内側の空きスペースにギリギリ収まるようクランプ） */}
           {isEmergencyStop && (
             <div
               className="absolute flex items-center gap-1 bg-red-700/90 text-white rounded px-2 py-0.5 border border-red-400 font-bold whitespace-nowrap"
               style={{
-                left: `${(sceneLayout.beltCenterFinal.x / SW * 100).toFixed(1)}%`,
-                top: `${(sceneLayout.beltCenterFinal.y / SH * 100).toFixed(1)}%`,
+                left: `${(sceneLayout.emergencyPopupFinal.x / SW * 100).toFixed(1)}%`,
+                top: `${(sceneLayout.emergencyPopupFinal.y / SH * 100).toFixed(1)}%`,
                 transform: 'translate(-50%, -50%)',
                 fontSize: '11px',
                 zIndex: 10,
