@@ -204,6 +204,7 @@ interface HistPt {
   floor: number;
   done: number;
   queues: number[];
+  spawned: number;
 }
 
 interface SimState {
@@ -767,6 +768,7 @@ function stepOnce(
       floor: activeFloor,
       done: s.totalDone,
       queues: s.workers.map(w => w.queue.length + (w.current ? 1 : 0)),
+      spawned: s.spawnedByDest.reduce((a, b) => a + b, 0),
     });
   }
 }
@@ -778,9 +780,25 @@ function queueColor(qLen: number): string {
 }
 
 // ── Inline chart drawn inside belt center ────────────────────
-function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCapacity: number, outerLaneCapacity: number) {
+// 右軸（投入済み荷物量）の上限をきりのよい数値に切り上げる
+function niceCeil(value: number): number {
+  if (value <= 0) return 10;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(value)));
+  const norm = value / magnitude;
+  const niceNorm = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  return niceNorm * magnitude;
+}
+
+// グラフの各系列を表示するかどうか（右サイドパネルのタブで切り替え）
+interface ChartSeriesVisible {
+  belt: boolean;
+  spawned: boolean;
+  done: boolean;
+}
+
+function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCapacity: number, outerLaneCapacity: number, visible: ChartSeriesVisible) {
   const x = CHART_X, y = CHART_Y, w = CHART_W, h = CHART_H;
-  const pad = { l: 52, r: 8, t: 28, b: 32 };
+  const pad = { l: 52, r: 44, t: 42, b: 32 };
   const gw = w - pad.l - pad.r;
   const gh = h - pad.t - pad.b;
 
@@ -788,11 +806,6 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
   ctx.beginPath(); ctx.roundRect(x, y, w, h, 8); ctx.fill();
   ctx.strokeStyle = 'rgba(75,85,99,0.5)'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.roundRect(x, y, w, h, 8); ctx.stroke();
-
-  // オーバーフロー数は常時表示（hist が少なくても見える）
-  ctx.fillStyle = '#EF4444'; ctx.font = '14px sans-serif';
-  ctx.textAlign = 'right'; ctx.textBaseline = 'top';
-  ctx.fillText(`オーバーフロー: ${s.totalOverflow}個`, x + w - pad.r, y + 6);
 
   const hist = s.hist;
   if (hist.length < 2) {
@@ -812,6 +825,10 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
   const px = (t: number) => x + pad.l + ((t - startT) / spanT) * gw;
   const py = (v: number) => y + pad.t + gh - (v / maxAll) * gh;
 
+  // 右軸: 投入済み荷物量（累計・単調増加なので最終値を基準に上限を決める）
+  const rightMax = niceCeil(hist[hist.length - 1].spawned);
+  const pyRight = (v: number) => y + pad.t + gh - (v / rightMax) * gh;
+
   const yTicks = [0, 50, 100, 150, 200, 250];
   for (const tick of yTicks) {
     const gy = py(tick);
@@ -820,12 +837,34 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.beginPath(); ctx.moveTo(x + pad.l, gy); ctx.lineTo(x + w - pad.r, gy); ctx.stroke();
   }
 
-  ctx.beginPath();
-  hist.forEach((h, i) => {
-    const v = Math.min(h.belt as number, maxAll);
-    i === 0 ? ctx.moveTo(px(h.t), py(v)) : ctx.lineTo(px(h.t), py(v));
-  });
-  ctx.strokeStyle = '#3B82F6'; ctx.lineWidth = 1.8; ctx.stroke();
+  if (visible.belt) {
+    ctx.beginPath();
+    hist.forEach((h, i) => {
+      const v = Math.min(h.belt as number, maxAll);
+      i === 0 ? ctx.moveTo(px(h.t), py(v)) : ctx.lineTo(px(h.t), py(v));
+    });
+    ctx.strokeStyle = '#3B82F6'; ctx.lineWidth = 1.8; ctx.stroke();
+  }
+
+  // 投入済み荷物量（累計・右軸）ライン
+  if (visible.spawned) {
+    ctx.beginPath();
+    hist.forEach((h, i) => {
+      const v = h.spawned;
+      i === 0 ? ctx.moveTo(px(h.t), pyRight(v)) : ctx.lineTo(px(h.t), pyRight(v));
+    });
+    ctx.strokeStyle = '#C084FC'; ctx.lineWidth = 1.8; ctx.stroke();
+  }
+
+  // 処理済み荷物量（累計・右軸）ライン
+  if (visible.done) {
+    ctx.beginPath();
+    hist.forEach((h, i) => {
+      const v = h.done;
+      i === 0 ? ctx.moveTo(px(h.t), pyRight(v)) : ctx.lineTo(px(h.t), pyRight(v));
+    });
+    ctx.strokeStyle = '#22C55E'; ctx.lineWidth = 1.8; ctx.stroke();
+  }
 
   // 内側レーン上限（オーバーフロー）ライン（赤・太線）= 外側上限 + 内側上限
   const innerLineY = py(Math.min(outerLaneCapacity + innerLaneCapacity, maxAll));
@@ -839,11 +878,19 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.restore();
   }
 
-  // Y-axis labels
-  ctx.fillStyle = '#64748B'; ctx.font = '14px sans-serif';
+  // Y-axis labels（左軸: ベルト上の荷物。文字色は「ベルト上の荷物」の線と同じ青）
+  ctx.fillStyle = visible.belt ? '#3B82F6' : '#374151'; ctx.font = '14px sans-serif';
   ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
   for (const tick of yTicks) {
     ctx.fillText(tick === 0 ? '0' : `${tick}個`, x + pad.l - 3, py(tick));
+  }
+
+  // Y-axis labels（右軸: 投入量・処理済。左軸と同じ目盛位置に対応する値を表示）
+  ctx.fillStyle = (visible.spawned || visible.done) ? '#94A3B8' : '#374151'; ctx.font = '12px sans-serif';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  for (const tick of yTicks) {
+    const v = Math.round((tick / maxAll) * rightMax);
+    ctx.fillText(v === 0 ? '0' : `${v.toLocaleString()}`, x + w - pad.r + 4, py(tick));
   }
 
   // X-axis time ticks (minutes)
@@ -873,13 +920,28 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     xt += tickIntervalSec;
   }
 
-  // Legend
+  // Legend（1段目: 左軸の系列 / 2段目: 右軸の系列）
   const legLx = x + pad.l;
-  const legLy = y + 6;
+  const legLy1 = y + 6;
+  const legLy2 = legLy1 + 14;
   ctx.textBaseline = 'top';
-  ctx.fillStyle = '#3B82F6'; ctx.fillRect(legLx, legLy, 18, 9);
-  ctx.fillStyle = '#94A3B8'; ctx.font = '14px sans-serif'; ctx.textAlign = 'left';
-  ctx.fillText('ベルト上', legLx + 22, legLy);
+  ctx.font = '12px sans-serif';
+
+  const legLabel1 = 'ベルト上の荷物（左軸）';
+  ctx.fillStyle = visible.belt ? '#3B82F6' : '#374151'; ctx.fillRect(legLx, legLy1, 16, 8);
+  ctx.fillStyle = visible.belt ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
+  ctx.fillText(legLabel1, legLx + 20, legLy1);
+
+  const legLabel2 = '投入量（右軸）';
+  ctx.fillStyle = visible.spawned ? '#C084FC' : '#374151'; ctx.fillRect(legLx, legLy2, 16, 8);
+  ctx.fillStyle = visible.spawned ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
+  ctx.fillText(legLabel2, legLx + 20, legLy2);
+
+  const legLx3 = legLx + ctx.measureText(legLabel2).width + 30;
+  const legLabel3 = '処理済（右軸）';
+  ctx.fillStyle = visible.done ? '#22C55E' : '#374151'; ctx.fillRect(legLx3, legLy2, 16, 8);
+  ctx.fillStyle = visible.done ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
+  ctx.fillText(legLabel3, legLx3 + 20, legLy2);
 }
 
 // ── Stats panel drawn on offscreen canvas (right side of recording) ──
@@ -906,7 +968,7 @@ function drawStatsPanel(ctx: CanvasRenderingContext2D, s: SimState, simSpeed: nu
   const statLines: { text: string; color: string }[] = [
     { text: `時刻: ${fmtSimTime(s.time)}`, color: '#E5E7EB' },
     { text: `投入済: ${spawned} 個`, color: '#E5E7EB' },
-    { text: `ベルト上: ${beltCount} 個`, color: '#E5E7EB' },
+    { text: `ベルト上の荷物: ${beltCount} 個`, color: '#E5E7EB' },
     { text: `処理済: ${s.totalDone} 個`, color: '#E5E7EB' },
     { text: `床仮置き: ${floorCount} 個 / 累計: ${s.totalFloor} 個`, color: '#E5E7EB' },
     { text: `オーバーフロー: ${overflow} 個`, color: overflow > 0 ? '#FB923C' : '#E5E7EB' },
@@ -962,7 +1024,7 @@ function drawStatsPanel(ctx: CanvasRenderingContext2D, s: SimState, simSpeed: nu
 }
 
 // ── Draw simulation canvas ───────────────────────────────────
-function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean) {
+function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean, chartSeriesVisible: ChartSeriesVisible) {
   const { workers, bags, beltW: BW, beltH: BH, beltR: BR } = s;
 
   ctx.fillStyle = '#111827';
@@ -995,7 +1057,7 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
   }
 
   // Inline chart in belt center
-  drawInlineChart(ctx, s, innerLaneCapacity, outerLaneCapacity);
+  drawInlineChart(ctx, s, innerLaneCapacity, outerLaneCapacity, chartSeriesVisible);
 
   // Dimension arrows and labels
   const arrowOff = 20;
@@ -1321,6 +1383,10 @@ export default function BaggageSimulation() {
   );
   const [clockwise, setClockwise] = useState(false);
   const [injectionRuleId, setInjectionRuleId] = useState<string>(INJECTION_RULES[0].id);
+  const [chartSeriesVisible, setChartSeriesVisible] = useState<ChartSeriesVisible>({ belt: true, spawned: true, done: true });
+  const toggleChartSeries = (key: keyof ChartSeriesVisible) => {
+    setChartSeriesVisible(prev => ({ ...prev, [key]: !prev[key] }));
+  };
   // 「エクセル読み込み」ルール用の状態
   // フォーマット: A列=便名（2行目以降）、C列以降=5分刻みの時間帯ごとの投入数（2行目以降）
   const excelFlightEventsRef = useRef<FlightSpawnEvent[]>([]); // 読み込んだ全便の投入スケジュール（時刻順）
@@ -1488,7 +1554,7 @@ export default function BaggageSimulation() {
           : s;
       const simCtx = simCanvasRef.current?.getContext('2d');
       if (simCtx) {
-        drawSim(simCtx, displayState, now, destQuantities, innerLaneCapacity, outerLaneCapacity, clockwise);
+        drawSim(simCtx, displayState, now, destQuantities, innerLaneCapacity, outerLaneCapacity, clockwise, chartSeriesVisible);
         if (isRecordingRef.current && offscreenCanvasRef.current && simCanvasRef.current) {
           const offCtx = offscreenCanvasRef.current.getContext('2d');
           if (offCtx) {
@@ -1524,7 +1590,7 @@ export default function BaggageSimulation() {
     };
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
-  }, [arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId]);
+  }, [arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId, chartSeriesVisible]);
 
   const toggleRunning = () => {
     if (!runningRef.current && scrubIndexRef.current !== null) {
@@ -1789,7 +1855,7 @@ export default function BaggageSimulation() {
           <div className={`bg-gray-900 rounded-lg p-4 border font-mono space-y-1 ${overlayStats.overflow > 0 ? 'border-orange-500' : 'border-gray-700'}`}>
             <div className="text-gray-200" style={{ fontSize: '14px' }}>時刻: {fmtSimTime(overlayStats.time)}</div>
             <div className="text-gray-200" style={{ fontSize: '14px' }}>投入済: {overlayStats.spawned} 個</div>
-            <div className="text-gray-200" style={{ fontSize: '14px' }}>ベルト上: {overlayStats.belt} 個</div>
+            <div className="text-gray-200" style={{ fontSize: '14px' }}>ベルト上の荷物: {overlayStats.belt} 個</div>
             <div className="text-gray-200" style={{ fontSize: '14px' }}>処理済: {overlayStats.done} 個</div>
             <div className="text-gray-200" style={{ fontSize: '14px' }}>床仮置き: {overlayStats.floor} 個 / 累計: {overlayStats.totalFloor} 個</div>
             <div style={{ fontSize: '14px', color: overlayStats.overflow > 0 ? '#FB923C' : '#E5E7EB' }}>
@@ -1853,6 +1919,31 @@ export default function BaggageSimulation() {
                 シミュレーション開始後に表示
               </div>
             )}
+          </div>
+
+          {/* グラフ表示切り替えタブ（各線ごとにON/OFFできる） */}
+          <div className="bg-gray-900 rounded-lg p-4 border border-gray-700">
+            <div className="text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wide">グラフ表示</div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => toggleChartSeries('belt')}
+                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.belt ? 'bg-blue-600 border-blue-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
+              >
+                ベルト上の荷物
+              </button>
+              <button
+                onClick={() => toggleChartSeries('spawned')}
+                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.spawned ? 'bg-purple-600 border-purple-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
+              >
+                投入量
+              </button>
+              <button
+                onClick={() => toggleChartSeries('done')}
+                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.done ? 'bg-green-600 border-green-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
+              >
+                処理済
+              </button>
+            </div>
           </div>
         </div>
       </div>
