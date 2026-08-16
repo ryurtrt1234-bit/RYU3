@@ -886,15 +886,19 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
   }
 
   // 内側レーン上限（オーバーフロー）ライン（赤・太線・半透明）= 外側上限 + 内側上限
-  const innerLineY = py(Math.min(outerLaneCapacity + innerLaneCapacity, maxAll));
-  if (innerLineY >= y + pad.t && innerLineY <= y + pad.t + gh) {
-    ctx.save();
-    ctx.strokeStyle = 'rgba(239,68,68,0.5)'; ctx.lineWidth = 2.5; ctx.setLineDash([]);
-    ctx.beginPath(); ctx.moveTo(x + pad.l, innerLineY); ctx.lineTo(x + w - pad.r, innerLineY); ctx.stroke();
-    ctx.fillStyle = '#EF4444'; ctx.font = '14px sans-serif';
-    ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
-    ctx.fillText(`ベルト上の手荷物キャパ: ${outerLaneCapacity + innerLaneCapacity}個`, x + pad.l + 2, innerLineY - 1);
-    ctx.restore();
+  // 上限を「無限」にしている場合はキャパという概念がなくなるため、赤線・ラベルとも非表示にする
+  const laneCapacityTotal = outerLaneCapacity + innerLaneCapacity;
+  if (Number.isFinite(laneCapacityTotal)) {
+    const innerLineY = py(Math.min(laneCapacityTotal, maxAll));
+    if (innerLineY >= y + pad.t && innerLineY <= y + pad.t + gh) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(239,68,68,0.5)'; ctx.lineWidth = 2.5; ctx.setLineDash([]);
+      ctx.beginPath(); ctx.moveTo(x + pad.l, innerLineY); ctx.lineTo(x + w - pad.r, innerLineY); ctx.stroke();
+      ctx.fillStyle = '#EF4444'; ctx.font = '14px sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+      ctx.fillText(`ベルト上の手荷物キャパ: ${laneCapacityTotal}個`, x + pad.l + 2, innerLineY - 1);
+      ctx.restore();
+    }
   }
 
   // Y-axis labels（左軸: ベルト上の荷物。文字色は「ベルト上の荷物」の線と同じ青）
@@ -1402,6 +1406,10 @@ export default function BaggageSimulation() {
   const [workerTravelTime, setWorkerTravelTime]       = useState(2);
   const [outerLaneCapacity, setOuterLaneCapacity] = useState(100);
   const [innerLaneCapacity, setInnerLaneCapacity] = useState(100);
+  // ONのとき外側・内側レーン上限を両方とも無限（Infinity）として扱う。オーバーフロー/緊急停止も発生しなくなる。
+  const [unlimitedLaneCapacity, setUnlimitedLaneCapacity] = useState(false);
+  const effOuterLaneCapacity = unlimitedLaneCapacity ? Infinity : outerLaneCapacity;
+  const effInnerLaneCapacity = unlimitedLaneCapacity ? Infinity : innerLaneCapacity;
   const [emergencyMargin, setEmergencyMargin]             = useState(20);
   const [emergencyCollectInterval, setEmergencyCollectInterval] = useState(3);
   const [workerDests, setWorkerDests]     = useState<number[][]>(
@@ -1559,7 +1567,7 @@ export default function BaggageSimulation() {
         });
         const perimMeters = s.beltPerim / PIXELS_PER_METER;
         const circuitsPerSec = beltSpeedMS / perimMeters;
-        step(s, wallDt * simSpeed, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities, pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId);
+        step(s, wallDt * simSpeed, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities, pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId);
 
         // 0-5分は30秒刻み、5分以降は300秒刻みでスナップショット保存
         const snapInterval = s.time < 300 ? 30 : 300;
@@ -1595,7 +1603,7 @@ export default function BaggageSimulation() {
           : s;
       const simCtx = simCanvasRef.current?.getContext('2d');
       if (simCtx) {
-        drawSim(simCtx, displayState, now, destQuantities, innerLaneCapacity, outerLaneCapacity, clockwise, chartSeriesVisible);
+        drawSim(simCtx, displayState, now, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible);
         if (isRecordingRef.current && offscreenCanvasRef.current && simCanvasRef.current) {
           const offCtx = offscreenCanvasRef.current.getContext('2d');
           if (offCtx) {
@@ -1634,7 +1642,7 @@ export default function BaggageSimulation() {
     };
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
-  }, [arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId, chartSeriesVisible]);
+  }, [arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId, chartSeriesVisible]);
 
   const toggleRunning = () => {
     if (!runningRef.current && scrubIndexRef.current !== null) {
@@ -1693,7 +1701,7 @@ export default function BaggageSimulation() {
         w.assignedDests = workerDests[wi] ?? [];
       });
       step(s, dt, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities,
-           pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId);
+           pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId);
 
       // 0-5分は30秒刻み、5分以降は300秒刻みでスナップショット保存
       const snapInterval2 = s.time < 300 ? 30 : 300;
@@ -1748,7 +1756,7 @@ export default function BaggageSimulation() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
       beltSpeedMS, arrivalInterval, floorDropProb, destQuantities, pickupRate, pickupForceThreshold,
-      outerLaneCapacity, innerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId]);
+      effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId]);
 
   const updateWorkerSpeed = (i: number, v: number) => {
     setWorkerSpeeds(prev => { const next = [...prev]; next[i] = v; return next; });
@@ -2123,9 +2131,30 @@ export default function BaggageSimulation() {
               >時計回り</button>
             </div>
           </div>
-          <Slider label={`外側レーン上限: ${outerLaneCapacity} 個`}           min={10}  max={200}  step={5}     value={outerLaneCapacity} onChange={setOuterLaneCapacity} />
-          <Slider label={`内側レーン上限: ${innerLaneCapacity} 個`}           min={10}  max={200}  step={5}     value={innerLaneCapacity} onChange={setInnerLaneCapacity} />
-          <Slider label={`緊急停止荷物数（ベルト上）: ${outerLaneCapacity + innerLaneCapacity}個 - ${emergencyMargin} 個`}           min={0}   max={50}   step={5}     value={emergencyMargin}         onChange={setEmergencyMargin} />
+          {/* 外側・内側レーン上限を両方とも無限にするチェックボックス。ONの場合はグラフの赤線・キャパ表示も消える */}
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={unlimitedLaneCapacity}
+              onChange={e => setUnlimitedLaneCapacity(e.target.checked)}
+              className="accent-blue-500 w-4 h-4 cursor-pointer"
+            />
+            <span className="text-xs text-gray-300">レーン上限を無限にする（外側・内側とも）</span>
+          </label>
+          <Slider
+            label={unlimitedLaneCapacity ? '外側レーン上限: ∞' : `外側レーン上限: ${outerLaneCapacity} 個`}
+            min={10} max={200} step={5} value={outerLaneCapacity} onChange={setOuterLaneCapacity}
+            disabled={unlimitedLaneCapacity}
+          />
+          <Slider
+            label={unlimitedLaneCapacity ? '内側レーン上限: ∞' : `内側レーン上限: ${innerLaneCapacity} 個`}
+            min={10} max={200} step={5} value={innerLaneCapacity} onChange={setInnerLaneCapacity}
+            disabled={unlimitedLaneCapacity}
+          />
+          <Slider
+            label={unlimitedLaneCapacity ? '緊急停止荷物数（ベルト上）: ∞ - ' + emergencyMargin + ' 個' : `緊急停止荷物数（ベルト上）: ${outerLaneCapacity + innerLaneCapacity}個 - ${emergencyMargin} 個`}
+            min={0} max={50} step={5} value={emergencyMargin} onChange={setEmergencyMargin}
+          />
           <Slider label={`緊急停止床置き時間: ${emergencyCollectInterval} 秒/個`} min={0}   max={10}   step={0.5}   value={emergencyCollectInterval} onChange={setEmergencyCollectInterval} />
         </div>
 
@@ -2285,17 +2314,18 @@ export default function BaggageSimulation() {
 }
 
 // ── Reusable slider ──────────────────────────────────────────
-function Slider({ label, min, max, step, value, onChange }: {
+function Slider({ label, min, max, step, value, onChange, disabled }: {
   label: string; min: number; max: number; step: number;
-  value: number; onChange: (v: number) => void;
+  value: number; onChange: (v: number) => void; disabled?: boolean;
 }) {
   return (
     <div>
-      <div className="text-xs text-gray-300 mb-1">{label}</div>
+      <div className={`text-xs mb-1 ${disabled ? 'text-gray-600' : 'text-gray-300'}`}>{label}</div>
       <input
         type="range" min={min} max={max} step={step} value={value}
         onChange={e => onChange(Number(e.target.value))}
-        className="w-full accent-blue-500 h-1.5 cursor-pointer"
+        disabled={disabled}
+        className={`w-full h-1.5 ${disabled ? 'accent-gray-600 cursor-not-allowed' : 'accent-blue-500 cursor-pointer'}`}
       />
     </div>
   );
