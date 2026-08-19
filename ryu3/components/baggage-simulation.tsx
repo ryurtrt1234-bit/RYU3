@@ -10,6 +10,24 @@ const STATS_PANEL_W = 280;
 // ── 公開URL（別PCから誰でもアクセスできる本番URL） ──────────────
 const PUBLIC_SIMULATION_URL = 'https://ryu3.vercel.app/simulation';
 
+// ── バージョン表示（タイトル右横の細字表示） ───────────────────
+// ビルド時（next.config.tsでGitコミット日時から埋め込み）の値を「Ver. YYYY/MM/DD HH:mm」形式に整形する。
+// 取得できない場合（ローカルでNEXT_PUBLIC_BUILD_COMMIT_TIMEが未設定など）は表示しない。
+function formatBuildVersionLabel(): string | null {
+  const iso = process.env.NEXT_PUBLIC_BUILD_COMMIT_TIME;
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('ja-JP', {
+    timeZone: 'Asia/Tokyo',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(d);
+  const get = (type: string) => parts.find(p => p.type === type)?.value ?? '';
+  return `Ver. ${get('year')}/${get('month')}/${get('day')} ${get('hour')}:${get('minute')}`;
+}
+const BUILD_VERSION_LABEL = formatBuildVersionLabel();
+
 // ── Belt rectangle (defaults) ──────────────────────────────
 const DEFAULT_LONG_SIDE = 38; // meters
 const DEFAULT_SHORT_SIDE = 6.5; // meters
@@ -2297,9 +2315,19 @@ export default function BaggageSimulation() {
   return (
     <div className="flex flex-col gap-3 p-4 bg-gray-950 min-h-screen text-gray-100">
       <div className="flex items-center justify-between">
-        <h1 className="text-lg font-bold text-gray-100">
-          空港手荷物処理能力シミュレーション
-        </h1>
+        <div className="flex items-baseline gap-2">
+          <h1 className="text-lg font-bold text-gray-100">
+            空港手荷物処理能力シミュレーション
+          </h1>
+          {BUILD_VERSION_LABEL && (
+            <span
+              className="text-[11px] font-light text-gray-500"
+              title="最終pushの日時（JST）"
+            >
+              {BUILD_VERSION_LABEL}
+            </span>
+          )}
+        </div>
         <div className="flex gap-2">
           <button
             onClick={handleCapturePeak}
