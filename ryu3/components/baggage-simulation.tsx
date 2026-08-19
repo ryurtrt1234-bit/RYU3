@@ -1654,6 +1654,17 @@ function fmtSimTime(totalSec: number): string {
   return `${String(Math.floor(s / 3600)).padStart(2, '0')}時間${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}分${String(s % 60).padStart(2, '0')}秒`;
 }
 
+// タイムライン（スクラブ）用スナップショットの複製ヘルパー。
+// hist は「1秒ごとに追記されるだけで、過去のエントリは書き換わらない」ため、
+// JSON往復で丸ごとディープコピーすると（スナップショット数 × hist長）でメモリが二乗的に膨れる。
+// hist だけは shallow slice（中身のHistPtオブジェクト自体は複数スナップショット間で共有）にすることで、
+// 「その時点までの長さで固定する」というスクラブの正しさを保ったまま複製コストをO(1)に抑える。
+function cloneStateForSnapshot(s: SimState): SimState {
+  const { hist, ...rest } = s;
+  const clone = JSON.parse(JSON.stringify(rest)) as Omit<SimState, 'hist'>;
+  return { ...clone, hist: hist.slice() };
+}
+
 // 「ピーク時キャプチャ」用: ベルト上荷物数が過去最大を更新するたびに、その瞬間のシミュレーション状態を
 // 丸ごと保持しておく（通常再生・「搭載終了」一括計算のどちらから呼んでも同じ挙動になる軽量な純関数）。
 interface MaxBeltSnapshot { count: number; snapshot: SimState | null }
@@ -1977,7 +1988,7 @@ export default function BaggageSimulation() {
         const snapTime = Math.floor(s.time / snapInterval) * snapInterval;
         if (snapTime > 0 && snapTime > lastSnapIdxRef.current) {
           lastSnapIdxRef.current = snapTime;
-          snapshotsRef.current.push(JSON.parse(JSON.stringify(s)));
+          snapshotsRef.current.push(cloneStateForSnapshot(s));
           setSnapshotCount(snapshotsRef.current.length);
         }
 
@@ -1991,7 +2002,7 @@ export default function BaggageSimulation() {
           runningRef.current = false;
           setRunning(false);
           setSimCompleted(true);
-          snapshotsRef.current.push(JSON.parse(JSON.stringify(s)));
+          snapshotsRef.current.push(cloneStateForSnapshot(s));
           const finalIdx = snapshotsRef.current.length - 1;
           setSnapshotCount(snapshotsRef.current.length);
           scrubIndexRef.current = finalIdx;
@@ -2114,7 +2125,7 @@ export default function BaggageSimulation() {
       const snapTime2 = Math.floor(s.time / snapInterval2) * snapInterval2;
       if (snapTime2 > 0 && snapTime2 > lastSnapIdxRef.current) {
         lastSnapIdxRef.current = snapTime2;
-        snapshotsRef.current.push(JSON.parse(JSON.stringify(s)));
+        snapshotsRef.current.push(cloneStateForSnapshot(s));
       }
 
       // 完了判定
@@ -2127,7 +2138,7 @@ export default function BaggageSimulation() {
     }
 
     // 最終スナップショット保存
-    snapshotsRef.current.push(JSON.parse(JSON.stringify(s)));
+    snapshotsRef.current.push(cloneStateForSnapshot(s));
     const finalIdx = snapshotsRef.current.length - 1;
     scrubIndexRef.current = finalIdx;
 
