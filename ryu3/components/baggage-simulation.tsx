@@ -1074,18 +1074,17 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.beginPath(); ctx.moveTo(x + pad.l, gy); ctx.lineTo(x + w - pad.r, gy); ctx.stroke();
   }
 
-  // 5分ごとの投入量（点のみ・右軸）。各区間の中央時刻に点を打つ（線ではつながない）。
+  // 5分ごとの投入量（細線・右軸）。各区間の中央時刻の値を細い線でつなぐ。
   // 「ベルト上の荷物」より先に描画することで、重なった際に背面に来るようにする。
   if (visible.bucketSpawn) {
     ctx.save();
-    ctx.fillStyle = '#EC4899';
-    bucketAmounts.forEach((b) => {
+    ctx.beginPath();
+    bucketAmounts.forEach((b, i) => {
       const bx = px(b.start + BUCKET_SEC / 2);
       const by = pyRight(b.amount);
-      ctx.beginPath();
-      ctx.arc(bx, by, 3, 0, Math.PI * 2);
-      ctx.fill();
+      i === 0 ? ctx.moveTo(bx, by) : ctx.lineTo(bx, by);
     });
+    ctx.strokeStyle = '#EC4899'; ctx.lineWidth = 0.6; ctx.stroke();
     ctx.restore();
   }
 
@@ -2230,6 +2229,69 @@ export default function BaggageSimulation() {
   const [isRecording, setIsRecording] = useState(false);
   const [urlCopied, setUrlCopied] = useState(false);
 
+  // 「pushして本番反映」ボタン（ローカルdev実行時のみ表示・動作）の状態。
+  // idle → pushing → deploying（Vercel反映待ち・ポーリング中） → done / no_changes / error
+  type DeployPhase = 'idle' | 'pushing' | 'deploying' | 'done' | 'no_changes' | 'error';
+  const [deployPhase, setDeployPhase] = useState<DeployPhase>('idle');
+  const [deployMessage, setDeployMessage] = useState<string>('');
+  const deployPollTimerRef = useRef<number | null>(null);
+
+  const stopDeployPolling = useCallback(() => {
+    if (deployPollTimerRef.current !== null) {
+      window.clearTimeout(deployPollTimerRef.current);
+      deployPollTimerRef.current = null;
+    }
+  }, []);
+
+  const pollDeployStatus = useCallback((sha: string) => {
+    fetch(`/api/deploy/status?sha=${sha}`)
+      .then(r => r.json())
+      .then((data: { status: string; url?: string; message?: string }) => {
+        if (data.status === 'READY') {
+          setDeployPhase('done');
+          setDeployMessage(data.url ? `https://${data.url}` : '');
+        } else if (data.status === 'ERROR') {
+          setDeployPhase('error');
+          setDeployMessage('Vercelでのビルドに失敗しました');
+        } else if (data.status === 'error') {
+          setDeployPhase('error');
+          setDeployMessage(data.message ?? '確認中にエラーが発生しました');
+        } else {
+          // pending / BUILDING / QUEUED 等 → 続けてポーリング
+          deployPollTimerRef.current = window.setTimeout(() => pollDeployStatus(sha), 5000);
+        }
+      })
+      .catch((e: Error) => {
+        setDeployPhase('error');
+        setDeployMessage(e.message);
+      });
+  }, []);
+
+  const handleDeployClick = useCallback(() => {
+    stopDeployPolling();
+    setDeployPhase('pushing');
+    setDeployMessage('');
+    fetch('/api/deploy', { method: 'POST' })
+      .then(r => r.json())
+      .then((data: { status: string; sha?: string; message?: string }) => {
+        if (data.status === 'pushed' && data.sha) {
+          setDeployPhase('deploying');
+          pollDeployStatus(data.sha);
+        } else if (data.status === 'no_changes') {
+          setDeployPhase('no_changes');
+        } else {
+          setDeployPhase('error');
+          setDeployMessage(data.message ?? 'pushに失敗しました');
+        }
+      })
+      .catch((e: Error) => {
+        setDeployPhase('error');
+        setDeployMessage(e.message);
+      });
+  }, [stopDeployPolling, pollDeployStatus]);
+
+  useEffect(() => stopDeployPolling, [stopDeployPolling]);
+
   const startRecording = useCallback(() => {
     if (!simCanvasRef.current) return;
     recordedChunksRef.current = [];
@@ -2328,7 +2390,42 @@ export default function BaggageSimulation() {
             </span>
           )}
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 items-center">
+          {process.env.NODE_ENV === 'development' && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleDeployClick}
+                disabled={deployPhase === 'pushing' || deployPhase === 'deploying'}
+                title="現在のワークスペースの変更をgit pushし、Vercelへの本番反映を確認します（ローカル開発時のみ）"
+                className={`px-4 py-1.5 rounded text-sm font-medium ${
+                  deployPhase === 'done' ? 'bg-emerald-600'
+                  : deployPhase === 'error' ? 'bg-red-600 hover:bg-red-700'
+                  : deployPhase === 'pushing' || deployPhase === 'deploying' ? 'bg-gray-600 cursor-wait'
+                  : 'bg-indigo-600 hover:bg-indigo-700'
+                }`}
+              >
+                {deployPhase === 'pushing' ? '⏳ push中…'
+                  : deployPhase === 'deploying' ? '⏳ 本番反映待ち…'
+                  : deployPhase === 'done' ? '✅ 本番反映完了'
+                  : deployPhase === 'no_changes' ? 'push完了(変更なし)'
+                  : deployPhase === 'error' ? '❌ 失敗（再試行）'
+                  : '🚀 pushして本番反映'}
+              </button>
+              {deployPhase === 'error' && deployMessage && (
+                <span className="text-xs text-red-400 max-w-xs truncate" title={deployMessage}>{deployMessage}</span>
+              )}
+              {deployPhase === 'done' && (
+                <a
+                  href={PUBLIC_SIMULATION_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs text-emerald-400 underline"
+                >
+                  {PUBLIC_SIMULATION_URL} を開く
+                </a>
+              )}
+            </div>
+          )}
           <button
             onClick={handleCapturePeak}
             disabled={!hasPeakCapture}
