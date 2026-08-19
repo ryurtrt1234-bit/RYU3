@@ -1040,11 +1040,10 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     if (curBucket >= 0) bucketAmounts.push({ start: curBucket * BUCKET_SEC, amount: lastCum - bucketStartCum });
   }
 
-  // 右軸: 「行先便数」「5分ごとの投入量」選択時はそれぞれの最大値、それ以外は投入済み荷物量
-  // （累計・単調増加なので最終値）を基準に上限を決める
+  // 右軸: 「5分ごとの投入量」選択時は常に250個で固定、「行先便数」選択時はその最大値、
+  // それ以外は投入済み荷物量（累計・単調増加なので最終値）を基準に上限を決める
   const flightsMaxVal = hist.reduce((m, h) => Math.max(m, h.flights), 0);
-  const bucketMaxVal = bucketAmounts.reduce((m, b) => Math.max(m, b.amount), 0);
-  const rightMax = visible.bucketSpawn ? niceCeil(Math.max(1, bucketMaxVal))
+  const rightMax = visible.bucketSpawn ? 250
     : visible.flights ? niceCeil(Math.max(1, flightsMaxVal))
     : niceCeil(hist[hist.length - 1].spawned);
   const pyRight = (v: number) => y + pad.t + gh - (v / rightMax) * gh;
@@ -1057,17 +1056,18 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.beginPath(); ctx.moveTo(x + pad.l, gy); ctx.lineTo(x + w - pad.r, gy); ctx.stroke();
   }
 
-  // 5分ごとの投入量（折れ線・右軸）。各区間の中央時刻に値をプロットして線で結ぶ。
+  // 5分ごとの投入量（点のみ・右軸）。各区間の中央時刻に点を打つ（線ではつながない）。
+  // 「ベルト上の荷物」より先に描画することで、重なった際に背面に来るようにする。
   if (visible.bucketSpawn) {
     ctx.save();
-    ctx.setLineDash([6, 4]);
-    ctx.beginPath();
-    bucketAmounts.forEach((b, i) => {
+    ctx.fillStyle = '#EC4899';
+    bucketAmounts.forEach((b) => {
       const bx = px(b.start + BUCKET_SEC / 2);
       const by = pyRight(b.amount);
-      i === 0 ? ctx.moveTo(bx, by) : ctx.lineTo(bx, by);
+      ctx.beginPath();
+      ctx.arc(bx, by, 3, 0, Math.PI * 2);
+      ctx.fill();
     });
-    ctx.strokeStyle = '#EC4899'; ctx.lineWidth = 1.8; ctx.stroke();
     ctx.restore();
   }
 
