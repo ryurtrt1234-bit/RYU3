@@ -1357,9 +1357,9 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
   // 現在稼働中（表示中）の作業者数をリアルタイムに表示する。作業者数は便数の右側に並べる。
   const flightsOnBeltNow = new Set(bags.filter(b => b.state === 'belt').map(b => b.destination)).size;
   const activeWorkerCountNow = workers.filter(w => w.visible).length;
-  ctx.fillStyle = '#E5E7EB'; ctx.font = 'bold 40px sans-serif';
+  ctx.fillStyle = '#E5E7EB'; ctx.font = 'bold 36px sans-serif';
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText(`${flightsOnBeltNow}便　${activeWorkerCountNow}名`, BCX, BCY);
+  ctx.fillText(`ベルト上${flightsOnBeltNow}便分/${activeWorkerCountNow}名配置`, BCX, BCY);
 
   // 便フィルタ（「全便」以外）選択中は、対象便のみ処理速度を個別に上書きしていることをベルト上に明示する
   if (chartDestFilter && chartDestFilter.indices.length > 0 && speedOverrideSeconds !== null) {
