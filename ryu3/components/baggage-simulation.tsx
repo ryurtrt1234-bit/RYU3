@@ -1124,7 +1124,7 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
       const v = h.flights;
       i === 0 ? ctx.moveTo(px(h.t), pyRight(v)) : ctx.lineTo(px(h.t), pyRight(v));
     });
-    ctx.strokeStyle = '#FBBF24'; ctx.lineWidth = 1.8; ctx.stroke();
+    ctx.strokeStyle = '#FBBF24'; ctx.lineWidth = 0.6; ctx.stroke();
   }
 
   // 内側レーン上限（オーバーフロー）ライン（赤・太線・半透明）= 外側上限 + 内側上限
@@ -1735,6 +1735,9 @@ export default function BaggageSimulation() {
   const [hasPeakCapture, setHasPeakCapture] = useState(false);
   const isRecordingRef        = useRef(false);
   const offscreenCanvasRef    = useRef<HTMLCanvasElement | null>(null);
+  // 「スタート〜搭載終了まで通し録画」ボタン用: このフラグが立っている間に搭載完了（simCompleted）
+  // すると自動で録画を停止する。手動の「録画開始」からの録画には影響しない。
+  const autoStopOnCompleteRef = useRef(false);
   // 現在の回で使う乱数シード。「固定」時は常にSIM_RNG_SEED、「ランダム」時はリセット(初期化)のたびに引き直す。
   // 通常再生と搭載終了は必ずこの同じ値を使うことで、同じ回の中では常に一致する結果になる。
   const activeSeedRef         = useRef<number>(SIM_RNG_SEED);
@@ -1756,6 +1759,9 @@ export default function BaggageSimulation() {
   const [workerSpeeds, setWorkerSpeeds]   = useState<number[]>(
     new Array(MAX_WORKERS).fill(10)
   );
+  // 「一括処理時間調整」バー専用の表示値。workerSpeeds[0]（作業1の値）を見て表示すると、
+  // 作業1バーを個別に動かした時にも一括バーが連動して見えてしまうため、独立させている。
+  const [batchSpeedAdjust, setBatchSpeedAdjust] = useState(10);
   const [floorDropProb, setFloorDropProb]         = useState(0.3);
   const [pickupRate, setPickupRate]               = useState(0.5);
   const [pickupForceThreshold, setPickupForceThreshold] = useState(50);
@@ -2213,6 +2219,7 @@ export default function BaggageSimulation() {
   };
   const updateAllWorkerSpeeds = (v: number) => {
     setWorkerSpeeds(new Array(MAX_WORKERS).fill(v));
+    setBatchSpeedAdjust(v);
   };
   const toggleDest = (wi: number, di: number) => {
     setWorkerDests(prev => {
@@ -2331,6 +2338,30 @@ export default function BaggageSimulation() {
     offscreenCanvasRef.current = null;
     setIsRecording(false);
   }, []);
+
+  // 「スタート〜搭載終了まで通し録画」: リセットして最初から実行を開始し、録画も同時に開始する。
+  // 全搭載完了で通常再生が自動停止するタイミング（simCompleted）に合わせて録画も自動停止・書き出しする。
+  const handleRecordFullRun = useCallback(() => {
+    runningRef.current = false;
+    setRunning(false);
+    reset();
+    autoStopOnCompleteRef.current = true;
+    // reset()によるinitSim（状態の再生成）が反映されてから録画・再生を開始する
+    requestAnimationFrame(() => {
+      startRecording();
+      runningRef.current = true;
+      setRunning(true);
+      setHasStarted(true);
+    });
+  }, [reset, startRecording]);
+
+  // 通し録画中に搭載が完了したら、自動で録画を停止（＝動画ファイルを書き出し）する。
+  useEffect(() => {
+    if (simCompleted && autoStopOnCompleteRef.current) {
+      autoStopOnCompleteRef.current = false;
+      stopRecording();
+    }
+  }, [simCompleted, stopRecording]);
 
   // 「ピーク時キャプチャ」: ベルト上荷物数が最大になった瞬間の状態を、オフスクリーンのキャンバスに
   // ベルト＋グラフとして再描画し、PNG画像としてダウンロードする（現在の画面表示には影響しない）。
@@ -2456,6 +2487,18 @@ export default function BaggageSimulation() {
           >
             {isRecording ? '⏹ 録画停止' : '⏺ 録画開始'}
           </button>
+          <button
+            onClick={handleRecordFullRun}
+            disabled={running || isRecording || isBatchComputing}
+            title="最初からリセットして実行を開始し、全搭載完了で自動的に録画を止めて動画（.webm）を書き出します"
+            className={`px-4 py-1.5 rounded text-sm font-medium ${
+              running || isRecording || isBatchComputing
+                ? 'bg-gray-800 text-gray-600 cursor-not-allowed'
+                : 'bg-purple-600 hover:bg-purple-700'
+            }`}
+          >
+            🎬 通し録画（スタート〜搭載終了）
+          </button>
         </div>
       </div>
 
@@ -2488,9 +2531,9 @@ export default function BaggageSimulation() {
           {/* 一括調整スライダー（左上オーバーレイ） */}
           <div className="absolute top-2 left-2 bg-gray-900/80 rounded-lg px-3 py-2 border border-gray-600" style={{ minWidth: '180px' }}>
             <Slider
-              label={`一括処理時間調整: ${workerSpeeds[0] ?? 10} 秒/個`}
+              label={`一括処理時間調整: ${batchSpeedAdjust} 秒/個`}
               min={5} max={15} step={1}
-              value={workerSpeeds[0] ?? 10}
+              value={batchSpeedAdjust}
               onChange={updateAllWorkerSpeeds}
             />
           </div>
@@ -2874,9 +2917,9 @@ export default function BaggageSimulation() {
           </div>
           <div className="pb-2 border-b border-gray-700">
             <Slider
-              label={`一括処理時間調整: ${workerSpeeds[0] ?? 10} 秒/個`}
+              label={`一括処理時間調整: ${batchSpeedAdjust} 秒/個`}
               min={5} max={15} step={1}
-              value={workerSpeeds[0] ?? 10}
+              value={batchSpeedAdjust}
               onChange={updateAllWorkerSpeeds}
             />
           </div>
