@@ -311,7 +311,7 @@ interface WorkerDef {
   floorDoneCount: number;
   doneCount: number;
   workloadPt: number;
-  // 腰痛リスクポイント: 荷物を床に置く（床仮置き・緊急停止時の強制床置き収集）1回につき1PT
+  // 腰痛リスク用の床置き回数（床仮置き・緊急停止時の強制床置き収集）。表示時に換算係数(PT/回)を掛ける
   backRiskPt: number;
   activeProcPt: number;
   assignedDests: number[];
@@ -1727,6 +1727,9 @@ export default function BaggageSimulation() {
   const [beltSpeedMS, setBeltSpeedMS]     = useState(0.4);
   const [simSpeed, setSimSpeed]           = useState(10);
   const [workerCount, setWorkerCount]     = useState(DEFAULT_WORKER_COUNT);
+  // 作業負荷ポイントの換算係数（表示時に掛け合わせる。シミュレーション内部は実作業秒数・床置き回数のみを累計）
+  const [caloriePtPerSec, setCaloriePtPerSec]   = useState(1);   // カロリーポイント: 実作業1秒あたりのPT
+  const [backRiskPtPerDrop, setBackRiskPtPerDrop] = useState(1); // 腰痛リスクポイント: 床置き1回あたりのPT
   const [workerSpeeds, setWorkerSpeeds]   = useState<number[]>(
     new Array(MAX_WORKERS).fill(10)
   );
@@ -2896,6 +2899,20 @@ export default function BaggageSimulation() {
               onChange={updateAllWorkerSpeeds}
             />
           </div>
+          <div className="pb-2 border-b border-gray-700">
+            <Slider
+              label={`カロリー換算: ${caloriePtPerSec.toFixed(1)} PT/秒`}
+              min={0} max={10} step={0.5}
+              value={caloriePtPerSec}
+              onChange={setCaloriePtPerSec}
+            />
+            <Slider
+              label={`腰痛リスク換算: ${backRiskPtPerDrop.toFixed(1)} PT/回`}
+              min={0} max={10} step={0.5}
+              value={backRiskPtPerDrop}
+              onChange={setBackRiskPtPerDrop}
+            />
+          </div>
           {Array.from({ length: workerCount }, (_, i) => {
             const st = stats[i];
             const q = st?.q ?? 0;
@@ -2912,10 +2929,10 @@ export default function BaggageSimulation() {
                   待ち: {q}個 / 床仮置き: {st?.floor ?? 0}個 / 通常済: {st?.done ?? 0}個 / 床済: {st?.floorDone ?? 0}個
                 </div>
                 <div className="text-xs text-amber-300 ml-2 mt-1">
-                  負荷: {(st?.workloadPt ?? 0).toFixed(1)} カロリーポイント（PT）
+                  負荷: {Math.round((st?.workloadPt ?? 0) * caloriePtPerSec)} カロリーポイント（PT）
                 </div>
                 <div className="text-xs text-rose-300 ml-2 mt-1">
-                  腰痛リスク: {st?.backRiskPt ?? 0} 腰痛リスクポイント（PT）
+                  腰痛リスク: {Math.round((st?.backRiskPt ?? 0) * backRiskPtPerDrop)} 腰痛リスクポイント（PT）
                 </div>
               </div>
             );
