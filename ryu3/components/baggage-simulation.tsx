@@ -310,6 +310,10 @@ interface WorkerDef {
   floorBatchActive: boolean;
   floorDoneCount: number;
   doneCount: number;
+  workloadPt: number;
+  // 腰痛リスクポイント: 荷物を床に置く（床仮置き・緊急停止時の強制床置き収集）1回につき1PT
+  backRiskPt: number;
+  activeProcPt: number;
   assignedDests: number[];
   emergencyCollectTimer: number;
   travelTimer: number;
@@ -478,6 +482,7 @@ function makeState(
     id: i, pos, speed: 1 / workerSpeeds[i],
     queue: [], current: null, procTimer: 0,
     floorQueue: [], activeFloor: null, floorBatchActive: false, floorDoneCount: 0, doneCount: 0,
+    workloadPt: 0, backRiskPt: 0, activeProcPt: 0,
     assignedDests: assignedDests[i] ?? [],
     emergencyCollectTimer: 0, travelTimer: 0,
     visible: !startHidden,
@@ -710,6 +715,7 @@ function stepOnce(
           targetBag.workerId = w.id;
           const ft = effectiveProcSeconds(w, targetBag.destination, speedOverride) + floorExtraTime;
           w.floorQueue.push({ id: targetBag.id, color: targetBag.color, timer: ft, maxTimer: ft, destination: targetBag.destination });
+          w.backRiskPt++;
           s.totalFloor++;
         }
       }
@@ -833,6 +839,7 @@ function stepOnce(
         bag.state = 'floor'; bag.workerId = w.id;
         const ft = effectiveProcSeconds(w, bag.destination, speedOverride) + floorExtraTime;
         w.floorQueue.push({ id: bag.id, color: bag.color, timer: ft, maxTimer: ft, destination: bag.destination });
+        w.backRiskPt++;
         s.totalFloor++; break;
       } else {
         bag.state = 'queued'; bag.workerId = w.id; bag.pos = w.pos; w.queue.push(bag); break;
@@ -853,6 +860,8 @@ function stepOnce(
       if (w.procTimer <= 0) {
         const finishedDest = w.current!.destination;
         s.bags = s.bags.filter(x => x.id !== w.current!.id);
+        w.workloadPt += w.activeProcPt;
+        w.activeProcPt = 0;
         w.current = null; w.doneCount++; s.totalDone++;
         w.travelTimer = workerTravelTime;
         s.doneByDest[finishedDest]++;
@@ -862,6 +871,7 @@ function stepOnce(
       // 床仮置き処理中 → 通常処理は開始しない
       w.activeFloor.timer -= dt;
       if (w.activeFloor.timer <= 0) {
+        w.workloadPt += w.activeFloor.maxTimer;
         w.floorDoneCount++; s.totalDone++;
         s.doneByDest[w.activeFloor.destination]++;
         markDestFinished(s, w.activeFloor.destination, destLimits);
@@ -882,7 +892,9 @@ function stepOnce(
           // バッチ完了: ベルトキューへ復帰
           w.floorBatchActive = false;
           if (w.queue.length > 0) {
-            w.current = w.queue.shift()!; w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride);
+            w.current = w.queue.shift()!;
+            w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride);
+            w.activeProcPt = w.procTimer;
           }
         }
       } else if (beltSparse && w.floorQueue.length >= floorBatchThreshold && w.queue.length === 0) {
@@ -892,7 +904,9 @@ function stepOnce(
         w.activeFloor.timer = w.activeFloor.maxTimer;
       } else if (w.queue.length > 0) {
         // 待ちキューを処理
-        w.current = w.queue.shift()!; w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride);
+        w.current = w.queue.shift()!;
+        w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride);
+        w.activeProcPt = w.procTimer;
       } else if (w.floorQueue.length > 0) {
         // アイドル中は閾値に関係なく床置きを処理
         w.floorBatchActive = true;
@@ -953,12 +967,6 @@ function stepOnce(
       doneByDest: s.doneByDest.slice(),
     });
   }
-}
-
-function queueColor(qLen: number): string {
-  if (qLen < 3) return '#22C55E';
-  if (qLen < 6) return '#EAB308';
-  return '#EF4444';
 }
 
 // ── Inline chart drawn inside belt center ────────────────────
@@ -1082,7 +1090,7 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     bucketAmounts.forEach((b, i) => {
       const bx = px(b.start + BUCKET_SEC / 2);
       const by = pyRight(b.amount);
-      i === 0 ? ctx.moveTo(bx, by) : ctx.lineTo(bx, by);
+      if (i === 0) ctx.moveTo(bx, by); else ctx.lineTo(bx, by);
     });
     ctx.strokeStyle = '#EC4899'; ctx.lineWidth = 0.6; ctx.stroke();
     ctx.restore();
@@ -1092,7 +1100,7 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.beginPath();
     hist.forEach((h, i) => {
       const v = Math.min(h.belt as number, maxAll);
-      i === 0 ? ctx.moveTo(px(h.t), py(v)) : ctx.lineTo(px(h.t), py(v));
+      if (i === 0) ctx.moveTo(px(h.t), py(v)); else ctx.lineTo(px(h.t), py(v));
     });
     ctx.strokeStyle = '#3B82F6'; ctx.lineWidth = 1.8; ctx.stroke();
   }
@@ -1102,7 +1110,7 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.beginPath();
     hist.forEach((h, i) => {
       const v = h.spawned;
-      i === 0 ? ctx.moveTo(px(h.t), pyRight(v)) : ctx.lineTo(px(h.t), pyRight(v));
+      if (i === 0) ctx.moveTo(px(h.t), pyRight(v)); else ctx.lineTo(px(h.t), pyRight(v));
     });
     ctx.strokeStyle = '#C084FC'; ctx.lineWidth = 1.8; ctx.stroke();
   }
@@ -1112,7 +1120,7 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.beginPath();
     hist.forEach((h, i) => {
       const v = h.done;
-      i === 0 ? ctx.moveTo(px(h.t), pyRight(v)) : ctx.lineTo(px(h.t), pyRight(v));
+      if (i === 0) ctx.moveTo(px(h.t), pyRight(v)); else ctx.lineTo(px(h.t), pyRight(v));
     });
     ctx.strokeStyle = '#22C55E'; ctx.lineWidth = 1.8; ctx.stroke();
   }
@@ -1122,7 +1130,7 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.beginPath();
     hist.forEach((h, i) => {
       const v = h.flights;
-      i === 0 ? ctx.moveTo(px(h.t), pyRight(v)) : ctx.lineTo(px(h.t), pyRight(v));
+      if (i === 0) ctx.moveTo(px(h.t), pyRight(v)); else ctx.lineTo(px(h.t), pyRight(v));
     });
     ctx.strokeStyle = '#FBBF24'; ctx.lineWidth = 0.6; ctx.stroke();
   }
@@ -1323,7 +1331,7 @@ function drawStatsPanel(ctx: CanvasRenderingContext2D, s: SimState, simSpeed: nu
 }
 
 // ── Draw simulation canvas ───────────────────────────────────
-function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean, chartSeriesVisible: ChartSeriesVisible, chartDestFilter: ChartDestFilter | null = null, speedOverrideSeconds: number | null = null) {
+function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean, chartSeriesVisible: ChartSeriesVisible, chartDestFilter: ChartDestFilter | null = null, speedOverrideSeconds: number | null = null) {
   const { workers, bags, beltW: BW, beltH: BH, beltR: BR, beltWidthPx } = s;
 
   ctx.fillStyle = '#111827';
@@ -1437,15 +1445,6 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
     ctx.fillText('投入', arrowCx - inx * 44, arrowCy - iny * 22);
   }
 
-  // Bottleneck detection（非表示中の作業者は対象外）
-  const visibleWorkers = workers.filter(w => w.visible);
-  const bottleneck = visibleWorkers.length > 0 ? visibleWorkers.reduce((a, b) => {
-    const qa = a.queue.length + (a.current ? 1 : 0);
-    const qb = b.queue.length + (b.current ? 1 : 0);
-    return qa >= qb ? a : b;
-  }) : null;
-  const bottleneckQueue = bottleneck ? bottleneck.queue.length + (bottleneck.current ? 1 : 0) : 0;
-
   // 作業者の「済/床」枠は全員のアイコン描画後にまとめて描く（後で描かれる別作業者のアイコンに
   // 枠が隠れてしまわないよう、枠を常に最前面にするため）
   const drawStatsBoxes: (() => void)[] = [];
@@ -1455,16 +1454,8 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
     if (!w.visible) continue;
     const [wx, wy] = workerXY(w, s);
     const totalQ = w.queue.length + (w.current ? 1 : 0);
-    const col = queueColor(totalQ);
-    const isBottleneck = w === bottleneck && bottleneckQueue >= 3;
+    const col = '#22C55E';
     const { normal: [nx, ny] } = beltInfo(w.pos, s);
-
-    if (isBottleneck) {
-      const pulse = 0.6 + 0.4 * Math.abs(Math.sin(now * 3));
-      ctx.save(); ctx.shadowColor = '#EF4444'; ctx.shadowBlur = 20 * pulse;
-      ctx.beginPath(); ctx.arc(wx, wy, 28 * pulse * 0.8 + 12, 0, Math.PI * 2);
-      ctx.strokeStyle = `rgba(239,68,68,${pulse * 0.9})`; ctx.lineWidth = 3; ctx.stroke(); ctx.restore();
-    }
 
     // Queue stack
     const queueBags = [...w.queue];
@@ -1546,12 +1537,6 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
       ctx.fillStyle = '#FEF3C7'; ctx.font = 'bold 10px sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.fillText(`床:${totalFloorCount}`, labelX, labelY);
-    }
-
-    if (isBottleneck) {
-      ctx.save(); ctx.fillStyle = '#FEF2F2'; ctx.font = 'bold 11px sans-serif';
-      ctx.textAlign = 'center'; ctx.shadowColor = '#EF4444'; ctx.shadowBlur = 8;
-      ctx.fillText('⚠ 渋滞', wx, wy + 32); ctx.restore();
     }
 
     // ── Worker stats box ─────────────────────────────────────
@@ -1647,20 +1632,6 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, now: number, destQu
 
   // シーン変換（ベルト＋作業者＋グラフの一括縮小）をここで終了。以降は実キャンバス座標系で固定表示。
   ctx.restore();
-
-  // Legend — top-right, also above belt
-  ctx.fillStyle = 'rgba(17,24,39,0.87)';
-  ctx.beginPath(); ctx.roundRect(SW - 148, 5, 140, 62, 7); ctx.fill();
-  [{ color: '#22C55E', label: '余裕あり' }, { color: '#EAB308', label: '混雑中' }, { color: '#EF4444', label: '渋滞！' }]
-    .forEach(({ color, label }, i) => {
-      ctx.beginPath(); ctx.arc(SW - 132, 20 + i * 16, 5, 0, Math.PI * 2);
-      ctx.fillStyle = color; ctx.fill();
-      ctx.fillStyle = '#D1D5DB'; ctx.font = '10px sans-serif';
-      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      ctx.fillText(label, SW - 122, 20 + i * 16);
-    });
-
-
 }
 
 // ── Simulation speed options ─────────────────────────────────
@@ -1896,7 +1867,7 @@ export default function BaggageSimulation() {
   const [scrubValue, setScrubValue]         = useState(0);
   const [snapshotCount, setSnapshotCount]   = useState(0);
   const [stats, setStats] = useState<{
-    id: number; q: number; floor: number; done: number; floorDone: number;
+    id: number; q: number; floor: number; done: number; floorDone: number; workloadPt: number; backRiskPt: number;
   }[]>([]);
   const [overlayStats, setOverlayStats] = useState<{ time: number; spawned: number; belt: number; done: number; floor: number; totalFloor: number; overflow: number; firstOuterExceedTime: number | null; firstOverflowTime: number | null; emergencyStopCount: number; emergencyStopTotalTime: number; flightsOnBelt: number; totalFlights: number }>({ time: 0, spawned: 0, belt: 0, done: 0, floor: 0, totalFloor: 0, overflow: 0, firstOuterExceedTime: null, firstOverflowTime: null, emergencyStopCount: 0, emergencyStopTotalTime: 0, flightsOnBelt: 0, totalFlights: 0 });
   const [isEmergencyStop, setIsEmergencyStop] = useState(false);
@@ -1979,7 +1950,6 @@ export default function BaggageSimulation() {
     lastTsRef.current = 0;
     maxBeltSnapshotRef.current = { count: -1, snapshot: null };
     setHasPeakCapture(false);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, rngMode]);
 
   useEffect(() => { initSim(); }, [initSim]);
@@ -2040,7 +2010,7 @@ export default function BaggageSimulation() {
           : s;
       const simCtx = simCanvasRef.current?.getContext('2d');
       if (simCtx) {
-        drawSim(simCtx, displayState, now, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null);
+        drawSim(simCtx, displayState, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null);
         if (isRecordingRef.current && offscreenCanvasRef.current && simCanvasRef.current) {
           const offCtx = offscreenCanvasRef.current.getContext('2d');
           if (offCtx) {
@@ -2057,6 +2027,8 @@ export default function BaggageSimulation() {
           floor: w.floorQueue.length + (w.activeFloor ? 1 : 0),
           done: w.doneCount,
           floorDone: w.floorDoneCount,
+          workloadPt: w.workloadPt,
+          backRiskPt: w.backRiskPt,
         })));
       }
       setOverlayStats({
@@ -2079,7 +2051,7 @@ export default function BaggageSimulation() {
     };
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
-  }, [arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId, chartSeriesVisible, chartDestFilter, speedOverride]);
+  }, [arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId, chartSeriesVisible, chartDestFilter, speedOverride]);
 
   const toggleRunning = () => {
     if (!runningRef.current && scrubIndexRef.current !== null) {
@@ -2178,6 +2150,8 @@ export default function BaggageSimulation() {
       floor: w.floorQueue.length + (w.activeFloor ? 1 : 0),
       done: w.doneCount,
       floorDone: w.floorDoneCount,
+      workloadPt: w.workloadPt,
+      backRiskPt: w.backRiskPt,
     })));
     setOverlayStats({
       time: snap.time,
@@ -2194,7 +2168,6 @@ export default function BaggageSimulation() {
       flightsOnBelt: new Set(snap.bags.filter(b => b.state === 'belt').map(b => b.destination)).size,
       totalFlights: new Set(snap.workers.flatMap(w => w.assignedDests)).size,
     });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
       beltSpeedMS, arrivalInterval, floorDropProb, destQuantities, pickupRate, pickupForceThreshold,
       effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride]);
@@ -2377,7 +2350,7 @@ export default function BaggageSimulation() {
     }
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    drawSim(ctx, snap, performance.now() / 1000, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null);
+    drawSim(ctx, snap, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null);
     const dataUrl = canvas.toDataURL('image/png');
     const a = document.createElement('a');
     a.href = dataUrl;
@@ -2937,6 +2910,12 @@ export default function BaggageSimulation() {
                 />
                 <div className={`text-xs ${col} ml-2 mt-1`}>
                   待ち: {q}個 / 床仮置き: {st?.floor ?? 0}個 / 通常済: {st?.done ?? 0}個 / 床済: {st?.floorDone ?? 0}個
+                </div>
+                <div className="text-xs text-amber-300 ml-2 mt-1">
+                  負荷: {(st?.workloadPt ?? 0).toFixed(1)} カロリーポイント（PT）
+                </div>
+                <div className="text-xs text-rose-300 ml-2 mt-1">
+                  腰痛リスク: {st?.backRiskPt ?? 0} 腰痛リスクポイント（PT）
                 </div>
               </div>
             );
