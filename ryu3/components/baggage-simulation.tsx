@@ -2213,53 +2213,20 @@ export default function BaggageSimulation() {
   const [urlCopied, setUrlCopied] = useState(false);
 
   // 「pushして本番反映」ボタン（ローカルdev実行時のみ表示・動作）の状態。
-  // idle → pushing → deploying（Vercel反映待ち・ポーリング中） → done / no_changes / error
-  type DeployPhase = 'idle' | 'pushing' | 'deploying' | 'done' | 'no_changes' | 'error';
+  // idle → pushing → done（push完了） / no_changes / error
+  // 本番反映はVercelのGitHub連携が自動で行うため、アプリ側では反映完了までの確認はしない。
+  type DeployPhase = 'idle' | 'pushing' | 'done' | 'no_changes' | 'error';
   const [deployPhase, setDeployPhase] = useState<DeployPhase>('idle');
   const [deployMessage, setDeployMessage] = useState<string>('');
-  const deployPollTimerRef = useRef<number | null>(null);
-
-  const stopDeployPolling = useCallback(() => {
-    if (deployPollTimerRef.current !== null) {
-      window.clearTimeout(deployPollTimerRef.current);
-      deployPollTimerRef.current = null;
-    }
-  }, []);
-
-  const pollDeployStatus = useCallback((sha: string) => {
-    fetch(`/api/deploy/status?sha=${sha}`)
-      .then(r => r.json())
-      .then((data: { status: string; url?: string; message?: string }) => {
-        if (data.status === 'READY') {
-          setDeployPhase('done');
-          setDeployMessage(data.url ? `https://${data.url}` : '');
-        } else if (data.status === 'ERROR') {
-          setDeployPhase('error');
-          setDeployMessage('Vercelでのビルドに失敗しました');
-        } else if (data.status === 'error') {
-          setDeployPhase('error');
-          setDeployMessage(data.message ?? '確認中にエラーが発生しました');
-        } else {
-          // pending / BUILDING / QUEUED 等 → 続けてポーリング
-          deployPollTimerRef.current = window.setTimeout(() => pollDeployStatus(sha), 5000);
-        }
-      })
-      .catch((e: Error) => {
-        setDeployPhase('error');
-        setDeployMessage(e.message);
-      });
-  }, []);
 
   const handleDeployClick = useCallback(() => {
-    stopDeployPolling();
     setDeployPhase('pushing');
     setDeployMessage('');
     fetch('/api/deploy', { method: 'POST' })
       .then(r => r.json())
       .then((data: { status: string; sha?: string; message?: string }) => {
-        if (data.status === 'pushed' && data.sha) {
-          setDeployPhase('deploying');
-          pollDeployStatus(data.sha);
+        if (data.status === 'pushed') {
+          setDeployPhase('done');
         } else if (data.status === 'no_changes') {
           setDeployPhase('no_changes');
         } else {
@@ -2271,9 +2238,7 @@ export default function BaggageSimulation() {
         setDeployPhase('error');
         setDeployMessage(e.message);
       });
-  }, [stopDeployPolling, pollDeployStatus]);
-
-  useEffect(() => stopDeployPolling, [stopDeployPolling]);
+  }, []);
 
   const startRecording = useCallback(() => {
     if (!simCanvasRef.current) return;
@@ -2402,18 +2367,17 @@ export default function BaggageSimulation() {
             <div className="flex items-center gap-2">
               <button
                 onClick={handleDeployClick}
-                disabled={deployPhase === 'pushing' || deployPhase === 'deploying'}
-                title="現在のワークスペースの変更をgit pushし、Vercelへの本番反映を確認します（ローカル開発時のみ）"
+                disabled={deployPhase === 'pushing'}
+                title="現在のワークスペースの変更をgit pushします（本番反映はVercelが自動で行います。ローカル開発時のみ）"
                 className={`px-4 py-1.5 rounded text-sm font-medium ${
                   deployPhase === 'done' ? 'bg-emerald-600'
                   : deployPhase === 'error' ? 'bg-red-600 hover:bg-red-700'
-                  : deployPhase === 'pushing' || deployPhase === 'deploying' ? 'bg-gray-600 cursor-wait'
+                  : deployPhase === 'pushing' ? 'bg-gray-600 cursor-wait'
                   : 'bg-indigo-600 hover:bg-indigo-700'
                 }`}
               >
                 {deployPhase === 'pushing' ? '⏳ push中…'
-                  : deployPhase === 'deploying' ? '⏳ 本番反映待ち…'
-                  : deployPhase === 'done' ? '✅ 本番反映完了'
+                  : deployPhase === 'done' ? '✅ push完了'
                   : deployPhase === 'no_changes' ? 'push完了(変更なし)'
                   : deployPhase === 'error' ? '❌ 失敗（再試行）'
                   : '🚀 pushして本番反映'}
@@ -2428,7 +2392,7 @@ export default function BaggageSimulation() {
                   rel="noreferrer"
                   className="text-xs text-emerald-400 underline"
                 >
-                  {PUBLIC_SIMULATION_URL} を開く
+                  {PUBLIC_SIMULATION_URL} を開く（本番反映まで数分かかります）
                 </a>
               )}
             </div>

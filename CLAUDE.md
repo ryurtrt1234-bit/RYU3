@@ -28,6 +28,7 @@
       └── lib/supabase/…             ← Supabase クライアント（Auth用、シミュレーション自体には不使用）
   ```
 - **デプロイ**: Vercel（`npx vercel --prod` で `ryu3/` ディレクトリからデプロイ）。🚧 公開URLは変わっている可能性があるため、最新は Vercel ダッシュボードで確認。
+  - ローカル開発時のみ表示される「🚀 pushして本番反映」ボタン（`app/api/deploy/route.ts`）は git commit & push のみを行い、成功時点で「✅ push完了」と表示する。本番反映は Vercel の GitHub 連携に任せ、アプリ側では反映完了の確認はしない（反映状況は Vercel ダッシュボードで確認）。
 
 ---
 
