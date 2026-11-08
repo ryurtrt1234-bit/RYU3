@@ -2865,7 +2865,7 @@ export default function BaggageSimulation() {
           </div>
           <div className="pb-2 border-b border-gray-700">
             <Slider
-              label={`カロリー換算＝累積作業時秒数 × ${caloriePtPerSec.toFixed(1)} PT/秒`}
+              label={`カロリーポイント＝累積作業時秒数 × ${caloriePtPerSec.toFixed(1)} PT/秒`}
               min={0} max={10} step={0.5}
               value={caloriePtPerSec}
               onChange={setCaloriePtPerSec}
