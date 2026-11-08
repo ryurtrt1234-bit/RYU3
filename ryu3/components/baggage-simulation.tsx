@@ -2865,23 +2865,31 @@ export default function BaggageSimulation() {
               value={caloriePtPerSec}
               onChange={setCaloriePtPerSec}
             />
-            <Slider
-              label={`直搭載腰痛リスク: ${backRiskPtPerDrop.toFixed(1)} PT/回`}
-              min={0} max={10} step={0.1}
-              value={backRiskPtPerDrop}
-              onChange={setBackRiskPtPerDrop}
-            />
-            <Slider
-              label={`床搭載腰痛リスク: ${floorBackRiskPt.toFixed(1)} PT/回`}
-              min={0} max={10} step={0.1}
-              value={floorBackRiskPt}
-              onChange={setFloorBackRiskPt}
-            />
+            <div className="grid grid-cols-2 gap-3">
+              <Slider
+                label={`直搭載腰痛リスク: ${backRiskPtPerDrop.toFixed(1)} PT/回`}
+                min={0} max={10} step={0.1}
+                value={backRiskPtPerDrop}
+                onChange={setBackRiskPtPerDrop}
+              />
+              <Slider
+                label={`床搭載腰痛リスク: ${floorBackRiskPt.toFixed(1)} PT/回`}
+                min={0} max={10} step={0.1}
+                value={floorBackRiskPt}
+                onChange={setFloorBackRiskPt}
+              />
+            </div>
           </div>
           {Array.from({ length: workerCount }, (_, i) => {
             const st = stats[i];
             const q = st?.q ?? 0;
             const col = q >= 6 ? 'text-red-400' : q >= 3 ? 'text-yellow-400' : 'text-green-400';
+            // 搭載率（直搭載＋床搭載が0のときは0除算を避けて「—」表示）
+            const directDone = st?.done ?? 0;
+            const floorDoneN = st?.floorDone ?? 0;
+            const loadedTotal = directDone + floorDoneN;
+            const floorRatePct = loadedTotal > 0 ? `${Math.round((floorDoneN / loadedTotal) * 100)}` : '—';
+            const directRatePct = loadedTotal > 0 ? `${Math.round((directDone / loadedTotal) * 100)}` : '—';
             return (
               <div key={i}>
                 <Slider
@@ -2891,13 +2899,15 @@ export default function BaggageSimulation() {
                   onChange={(v) => updateWorkerSpeed(i, v)}
                 />
                 <div className={`text-xs ${col} ml-2 mt-1`}>
-                  待ち: {q}個 / 床仮置き: {st?.floor ?? 0}個 / 直搭載: {st?.done ?? 0}個 / 床搭載: {st?.floorDone ?? 0}個
+                  待ち: {q}個 / 処理済: {loadedTotal}個 / 直搭載: {directDone}個 / 床搭載: {floorDoneN}個
                 </div>
-                <div className="text-xs text-amber-300 ml-2 mt-1">
-                  {Math.round((st?.workloadPt ?? 0) * caloriePtPerSec)} カロリーPT
+                <div className="text-xs ml-2 mt-1">
+                  <span className="text-amber-300">{Math.round((st?.workloadPt ?? 0) * caloriePtPerSec)} カロリーPT</span>
+                  <span className="text-gray-500"> / </span>
+                  <span className="text-rose-300">{Math.round(directDone * backRiskPtPerDrop + floorDoneN * floorBackRiskPt)} 腰痛リスクPT（＝直＋床）</span>
                 </div>
-                <div className="text-xs text-rose-300 ml-2 mt-1">
-                  {Math.round((st?.done ?? 0) * backRiskPtPerDrop + (st?.floorDone ?? 0) * floorBackRiskPt)} 腰痛リスクPT（＝直＋床）
+                <div className="text-xs text-gray-300 ml-2 mt-1">
+                  床搭載率 {floorRatePct}% / 直搭載率 {directRatePct}%
                 </div>
               </div>
             );
