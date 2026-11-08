@@ -311,8 +311,6 @@ interface WorkerDef {
   floorDoneCount: number;
   doneCount: number;
   workloadPt: number;
-  // 腰痛リスク用の床置き回数（床仮置き・緊急停止時の強制床置き収集）。表示時に換算係数(PT/回)を掛ける
-  backRiskPt: number;
   activeProcPt: number;
   assignedDests: number[];
   emergencyCollectTimer: number;
@@ -482,7 +480,7 @@ function makeState(
     id: i, pos, speed: 1 / workerSpeeds[i],
     queue: [], current: null, procTimer: 0,
     floorQueue: [], activeFloor: null, floorBatchActive: false, floorDoneCount: 0, doneCount: 0,
-    workloadPt: 0, backRiskPt: 0, activeProcPt: 0,
+    workloadPt: 0, activeProcPt: 0,
     assignedDests: assignedDests[i] ?? [],
     emergencyCollectTimer: 0, travelTimer: 0,
     visible: !startHidden,
@@ -715,7 +713,6 @@ function stepOnce(
           targetBag.workerId = w.id;
           const ft = effectiveProcSeconds(w, targetBag.destination, speedOverride) + floorExtraTime;
           w.floorQueue.push({ id: targetBag.id, color: targetBag.color, timer: ft, maxTimer: ft, destination: targetBag.destination });
-          w.backRiskPt++;
           s.totalFloor++;
         }
       }
@@ -839,7 +836,6 @@ function stepOnce(
         bag.state = 'floor'; bag.workerId = w.id;
         const ft = effectiveProcSeconds(w, bag.destination, speedOverride) + floorExtraTime;
         w.floorQueue.push({ id: bag.id, color: bag.color, timer: ft, maxTimer: ft, destination: bag.destination });
-        w.backRiskPt++;
         s.totalFloor++; break;
       } else {
         bag.state = 'queued'; bag.workerId = w.id; bag.pos = w.pos; w.queue.push(bag); break;
@@ -1728,8 +1724,9 @@ export default function BaggageSimulation() {
   const [simSpeed, setSimSpeed]           = useState(10);
   const [workerCount, setWorkerCount]     = useState(DEFAULT_WORKER_COUNT);
   // 作業負荷ポイントの換算係数（表示時に掛け合わせる。シミュレーション内部は実作業秒数・床置き回数のみを累計）
-  const [caloriePtPerSec, setCaloriePtPerSec]   = useState(1);   // カロリーポイント: 実作業1秒あたりのPT
-  const [backRiskPtPerDrop, setBackRiskPtPerDrop] = useState(1); // 腰痛リスクポイント: 床置き1回あたりのPT
+  const [caloriePtPerSec, setCaloriePtPerSec]   = useState(1);   // カロリーPT: 実作業1秒あたりのPT
+  const [backRiskPtPerDrop, setBackRiskPtPerDrop] = useState(0.7); // 直搭載1個あたりの腰痛リスクPT（腰痛リスクPT＝直搭載個数×この値＋床搭載個数×床搭載腰痛リスク）
+  const [floorBackRiskPt, setFloorBackRiskPt] = useState(1); // 床搭載1個あたりの腰痛リスクPT
   const [workerSpeeds, setWorkerSpeeds]   = useState<number[]>(
     new Array(MAX_WORKERS).fill(10)
   );
@@ -1870,7 +1867,7 @@ export default function BaggageSimulation() {
   const [scrubValue, setScrubValue]         = useState(0);
   const [snapshotCount, setSnapshotCount]   = useState(0);
   const [stats, setStats] = useState<{
-    id: number; q: number; floor: number; done: number; floorDone: number; workloadPt: number; backRiskPt: number;
+    id: number; q: number; floor: number; done: number; floorDone: number; workloadPt: number;
   }[]>([]);
   const [overlayStats, setOverlayStats] = useState<{ time: number; spawned: number; belt: number; done: number; floor: number; totalFloor: number; overflow: number; firstOuterExceedTime: number | null; firstOverflowTime: number | null; emergencyStopCount: number; emergencyStopTotalTime: number; flightsOnBelt: number; totalFlights: number }>({ time: 0, spawned: 0, belt: 0, done: 0, floor: 0, totalFloor: 0, overflow: 0, firstOuterExceedTime: null, firstOverflowTime: null, emergencyStopCount: 0, emergencyStopTotalTime: 0, flightsOnBelt: 0, totalFlights: 0 });
   const [isEmergencyStop, setIsEmergencyStop] = useState(false);
@@ -2031,7 +2028,6 @@ export default function BaggageSimulation() {
           done: w.doneCount,
           floorDone: w.floorDoneCount,
           workloadPt: w.workloadPt,
-          backRiskPt: w.backRiskPt,
         })));
       }
       setOverlayStats({
@@ -2154,7 +2150,6 @@ export default function BaggageSimulation() {
       done: w.doneCount,
       floorDone: w.floorDoneCount,
       workloadPt: w.workloadPt,
-      backRiskPt: w.backRiskPt,
     })));
     setOverlayStats({
       time: snap.time,
@@ -2865,16 +2860,22 @@ export default function BaggageSimulation() {
           </div>
           <div className="pb-2 border-b border-gray-700">
             <Slider
-              label={`カロリーポイント＝累積作業時秒数 × ${caloriePtPerSec.toFixed(1)} PT/秒`}
+              label={`カロリーPT＝累積作業時秒数 × ${caloriePtPerSec.toFixed(1)} PT/秒`}
               min={0} max={10} step={0.5}
               value={caloriePtPerSec}
               onChange={setCaloriePtPerSec}
             />
             <Slider
-              label={`腰痛リスク換算: ${backRiskPtPerDrop.toFixed(1)} PT/回`}
-              min={0} max={10} step={0.5}
+              label={`直搭載腰痛リスク: ${backRiskPtPerDrop.toFixed(1)} PT/回`}
+              min={0} max={10} step={0.1}
               value={backRiskPtPerDrop}
               onChange={setBackRiskPtPerDrop}
+            />
+            <Slider
+              label={`床搭載腰痛リスク: ${floorBackRiskPt.toFixed(1)} PT/回`}
+              min={0} max={10} step={0.1}
+              value={floorBackRiskPt}
+              onChange={setFloorBackRiskPt}
             />
           </div>
           {Array.from({ length: workerCount }, (_, i) => {
@@ -2890,13 +2891,13 @@ export default function BaggageSimulation() {
                   onChange={(v) => updateWorkerSpeed(i, v)}
                 />
                 <div className={`text-xs ${col} ml-2 mt-1`}>
-                  待ち: {q}個 / 床仮置き: {st?.floor ?? 0}個 / 通常済: {st?.done ?? 0}個 / 床済: {st?.floorDone ?? 0}個
+                  待ち: {q}個 / 床仮置き: {st?.floor ?? 0}個 / 直搭載: {st?.done ?? 0}個 / 床搭載: {st?.floorDone ?? 0}個
                 </div>
                 <div className="text-xs text-amber-300 ml-2 mt-1">
-                  負荷: {Math.round((st?.workloadPt ?? 0) * caloriePtPerSec)} カロリーポイント（PT）
+                  {Math.round((st?.workloadPt ?? 0) * caloriePtPerSec)} カロリーPT
                 </div>
                 <div className="text-xs text-rose-300 ml-2 mt-1">
-                  腰痛リスク: {Math.round((st?.backRiskPt ?? 0) * backRiskPtPerDrop)} 腰痛リスクポイント（PT）
+                  {Math.round((st?.done ?? 0) * backRiskPtPerDrop + (st?.floorDone ?? 0) * floorBackRiskPt)} 腰痛リスクPT（＝直＋床）
                 </div>
               </div>
             );
