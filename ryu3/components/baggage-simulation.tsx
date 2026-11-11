@@ -139,14 +139,15 @@ const DEFAULT_FLOOR_MAX = 10;
 // 実行のたびに/経路によって変わってしまわないよう、Math.random() の代わりに
 // シード固定の擬似乱数を使う。同じシナリオなら常に同じ乱数列になる。
 const SIM_RNG_SEED = 20260814;
-function mulberry32(seed: number): () => number {
-  let a = seed | 0;
-  return function () {
-    a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+// mulberry32 の内部状態を SimState.rngState（数値）に持たせ、呼ぶたびに進めて乱数を返す。
+// 関数（クロージャ）ではなく数値で持つことで、タイムライン用スナップショット（JSON複製）にも
+// 乱数の進み具合がそのまま保存され、スナップショットから再開しても乱数列が途切れない。
+function nextRandom(s: { rngState: number }): number {
+  const a = (s.rngState + 0x6D2B79F5) | 0;
+  s.rngState = a;
+  let t = Math.imul(a ^ (a >>> 15), 1 | a);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 }
 // 「ランダム」モード用: リセット（初期化）のたびに新しいシードを引く。
 // 通常再生・搭載終了ともにこの値を使い回すことで、同じ回の中では常に一致した結果になる。
@@ -363,8 +364,9 @@ interface SimState {
   // 「エクセル読み込み」ルール用: 便ごとの投入スケジュール（時刻順）と、次に処理すべき位置
   flightEvents: FlightSpawnEvent[] | null;
   flightEventIdx: number;
-  // シード固定の擬似乱数（再現性確保のため Math.random() の代わりに使う）
-  rng: () => number;
+  // シード固定の擬似乱数（mulberry32）の内部状態。nextRandom(s) で乱数を取り出す
+  // （再現性確保のため Math.random() の代わりに使う。数値なのでスナップショットにも保存される）
+  rngState: number;
   // 便（destination）ごとの搭載開始時刻（初回投入時刻）・完了時刻（投入予定数分の処理・床仮置き・
   // オーバーフロー破棄がすべて完了した時刻）。「一番手荷物量が多かった便の搭載所要時間」表示に使う。
   destFirstSpawnTime: (number | null)[];
@@ -497,7 +499,7 @@ function makeState(
     emergencyStopTotalTime: 0,
     flightEvents: flightEvents && flightEvents.length > 0 ? flightEvents : null,
     flightEventIdx: 0,
-    rng: mulberry32(rngSeed),
+    rngState: rngSeed | 0,
     destFirstSpawnTime: new Array(NUM_DESTS).fill(null),
     destFinishedCount: new Array(NUM_DESTS).fill(0),
     destCompletionTime: new Array(NUM_DESTS).fill(null),
@@ -746,7 +748,7 @@ function stepOnce(
         }
 
         // 2つの投入口からランダムに投入する
-        const spawnPos = INJECT_POSITIONS[s.rng() < 0.5 ? 0 : 1];
+        const spawnPos = INJECT_POSITIONS[nextRandom(s) < 0.5 ? 0 : 1];
         if (!placeBagOnBelt(s, dest, spawnPos, outerLaneCapacity)) {
           // 物理的な空きがない → 次のステップで同じ荷物を再試行する
           break;
@@ -770,7 +772,7 @@ function stepOnce(
               spawnedByDest: s.spawnedByDest,
               destLimits,
               time: s.time,
-              rng: s.rng,
+              rng: () => nextRandom(s),
             });
             s.spawnedByDest[dest]++;
             recordDestSpawn(s, dest);
@@ -782,18 +784,18 @@ function stepOnce(
               s.totalOverflow++;
               s.nextId++;
               markDestFinished(s, dest, destLimits);
-              s.nextSpawn += arrivalInterval * (0.6 + s.rng() * 0.8);
+              s.nextSpawn += arrivalInterval * (0.6 + nextRandom(s) * 0.8);
               continue;
             }
 
             if (!placeBagOnBelt(s, dest, spawnPos, outerLaneCapacity)) {
               // 両レーン全周で空きなし → 先行インクリメントを戻して再試行
               s.spawnedByDest[dest]--;
-              s.nextSpawn += arrivalInterval * (0.6 + s.rng() * 0.8);
+              s.nextSpawn += arrivalInterval * (0.6 + nextRandom(s) * 0.8);
               continue;
             }
           }
-          s.nextSpawn += arrivalInterval * (0.6 + s.rng() * 0.8);
+          s.nextSpawn += arrivalInterval * (0.6 + nextRandom(s) * 0.8);
         }
       }
     }
@@ -829,10 +831,10 @@ function stepOnce(
       if (w.current !== null || w.queue.length > 0) continue;
 
       const effectivePickupRate = beltBagCount <= pickupForceThreshold ? 1.0 : pickupRate;
-      if (s.rng() >= effectivePickupRate) continue;
+      if (nextRandom(s) >= effectivePickupRate) continue;
 
       const forceFloor = beltBagCount >= beltFloorTrigger;
-      if (w.floorQueue.length + (w.activeFloor ? 1 : 0) < floorMax && (forceFloor || s.rng() < floorDropProb)) {
+      if (w.floorQueue.length + (w.activeFloor ? 1 : 0) < floorMax && (forceFloor || nextRandom(s) < floorDropProb)) {
         bag.state = 'floor'; bag.workerId = w.id;
         const ft = effectiveProcSeconds(w, bag.destination, speedOverride) + floorExtraTime;
         w.floorQueue.push({ id: bag.id, color: bag.color, timer: ft, maxTimer: ft, destination: bag.destination });
@@ -1157,8 +1159,9 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
   // Y-axis labels（右軸: 投入量・処理済 または 行先便数 または 5分ごとの投入量。左軸と同じ目盛位置に対応する値を表示）
   // 単位は左軸と同様の付け方（0のときは単位なし）: 投入量・処理済は「個」、行先便数は「便」
   // 行先便数・5分ごとの投入量は右軸を専有する排他系列のため、文字色もその系列の線色に合わせる
+  // 処理済のみ選択時は処理済の線色（緑）に合わせる（投入量と同時選択時は共有軸のためグレー）
   const rightUnit = visible.flights ? '便' : '個';
-  const rightAxisColor = visible.bucketSpawn ? '#EC4899' : visible.flights ? '#FBBF24' : (visible.spawned || visible.done) ? '#94A3B8' : '#374151';
+  const rightAxisColor = visible.bucketSpawn ? '#EC4899' : visible.flights ? '#FBBF24' : (visible.done && !visible.spawned) ? '#22C55E' : (visible.spawned || visible.done) ? '#94A3B8' : '#374151';
   ctx.fillStyle = rightAxisColor; ctx.font = '18px sans-serif';
   ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
   for (const tick of yTicks) {
@@ -2893,7 +2896,12 @@ export default function BaggageSimulation() {
             return (
               <div key={i}>
                 <Slider
-                  label={`作業${i + 1}: ${workerSpeeds[i] ?? 10} 秒/個`}
+                  label={`作業${i + 1}: ${workerSpeeds[i] ?? 10} 秒/個　担当: ${
+                    // 担当便名とその便の予定投入数（行先便別投入数設定／エクセル読込の値）を並べて表示
+                    (workerDests[i] ?? []).length > 0
+                      ? (workerDests[i] ?? []).map(d => `${flightNames[d]}（${destQuantities[d] ?? 0}個）`).join(' / ')
+                      : 'なし'
+                  }`}
                   min={5} max={15} step={1}
                   value={workerSpeeds[i] ?? 10}
                   onChange={(v) => updateWorkerSpeed(i, v)}
