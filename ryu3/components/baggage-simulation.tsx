@@ -1765,15 +1765,39 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
       ctx.strokeStyle = '#60A5FA'; ctx.lineWidth = 3; ctx.stroke();
     }
 
-    // Worker circle
-    ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = 10;
-    ctx.beginPath(); ctx.arc(wx, wy, 20, 0, Math.PI * 2);
-    ctx.fillStyle = col + '33'; ctx.fill(); ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.stroke();
+    // Worker icon（全身の人型。旧・丸型アイコン（直径40px）とほぼ同じ範囲に収める: 高さ約40px・幅約30px、常に立ち姿）
+    // 人型アイコンの色は白（待ち件数バッジは緑の col のまま）
+    const iconCol = '#FFFFFF';
+    ctx.save(); ctx.shadowColor = iconCol; ctx.shadowBlur = 10;
+    ctx.strokeStyle = iconCol; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    // 腕（肩から斜め下へ）・脚（腰から斜め下へ）
+    ctx.lineWidth = 3.5;
+    ctx.beginPath();
+    ctx.moveTo(wx - 7, wy - 6); ctx.lineTo(wx - 13, wy + 5);
+    ctx.moveTo(wx + 7, wy - 6); ctx.lineTo(wx + 13, wy + 5);
+    ctx.stroke();
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(wx - 3.5, wy + 7); ctx.lineTo(wx - 6, wy + 19);
+    ctx.moveTo(wx + 3.5, wy + 7); ctx.lineTo(wx + 6, wy + 19);
+    ctx.stroke();
+    // 胴体・頭
+    ctx.lineWidth = 2;
+    ctx.fillStyle = iconCol + '55';
+    ctx.beginPath(); ctx.roundRect(wx - 7, wy - 8, 14, 16, 3); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(wx, wy - 14.5, 5.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
     ctx.restore();
-    ctx.fillStyle = '#F9FAFB'; ctx.font = 'bold 16px sans-serif';
+    // 作業者番号（胴体の中心に番号のみ。体からはみ出してよい大きさ: 22px、3桁は16px）。
+    // 白い体の上でも暗い背景の上でも読めるよう、黒の文字に白の縁取り
+    const workerNo = String(w.id + 1);
+    ctx.font = `bold ${workerNo.length >= 3 ? 16 : 22}px sans-serif`;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText('作業', wx, wy - 9);
-    ctx.fillText(String(w.id + 1), wx, wy + 9);
+    ctx.save();
+    ctx.lineJoin = 'round'; ctx.lineWidth = 3; ctx.strokeStyle = '#FFFFFF';
+    ctx.strokeText(workerNo, wx, wy);
+    ctx.fillStyle = '#000000';
+    ctx.fillText(workerNo, wx, wy);
+    ctx.restore();
 
     // Queue badge
     if (totalQ > 0) {
