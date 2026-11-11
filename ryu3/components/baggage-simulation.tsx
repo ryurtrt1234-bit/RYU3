@@ -126,6 +126,9 @@ const DEST_COLORS = [
   '#2A9D8F', '#DCBEFF', '#B5793A', '#FFFAC8', '#AAFFC3',
   '#B8B82E', '#FFD8B1', '#7B8CFF', '#FFFFFF', '#B03A3A',
 ];
+// 周回マーク（△・×）を白で描く荷物の色（黒だと見づらい濃い色: エンジ・赤・青）。それ以外の色の荷物では黒で描く。
+// 2周目以降の荷物は半透明でベルトの色と混ざるため、その状態でも黒のコントラストが低い色を選んでいる
+const LAP_MARK_LIGHT_ON_BAG_COLORS = new Set(['#B03A3A', '#E6194B', '#4363D8']);
 // 色が未割り当て（まだ荷物が投入されていない）便の表示色
 const UNASSIGNED_DEST_COLOR = '#4B5563';
 const DEST_NAMES = [
@@ -384,6 +387,14 @@ interface SimState {
   doneByDest: number[];
   // 便（destination）ごとに割り当てた荷物の色（未投入の便は null）。assignDestColor で割り当てる
   destColor: (string | null)[];
+  // 作業者がベルトから取った荷物の累計を、取った時点の周回で分けた数 [1周目, 2周目, 3周目以上]
+  // （circuits=0/1/2以上。通常のピック〔待ち行列・床置き〕と緊急停止時の床置き回収を含む）
+  pickByLap: [number, number, number];
+}
+
+// 荷物をベルトから取ったときに周回別ピック数を加算する
+function recordPickByLap(s: SimState, bag: Bag) {
+  s.pickByLap[Math.min(bag.circuits, 2)]++;
 }
 
 interface FlightSpawnEvent {
@@ -515,6 +526,7 @@ function makeState(
     destCompletionTime: new Array(NUM_DESTS).fill(null),
     doneByDest: new Array(NUM_DESTS).fill(0),
     destColor: new Array(NUM_DESTS).fill(null),
+    pickByLap: [0, 0, 0],
   };
 }
 
@@ -742,6 +754,7 @@ function stepOnce(
         const interval = emergencyCollectInterval > 0 ? emergencyCollectInterval : 0.001;
         if (w.emergencyCollectTimer >= interval) {
           w.emergencyCollectTimer -= interval;
+          recordPickByLap(s, targetBag);
           targetBag.state = 'floor';
           targetBag.workerId = w.id;
           const ft = effectiveProcSeconds(w, targetBag.destination, speedOverride) + floorExtraTime;
@@ -865,6 +878,7 @@ function stepOnce(
       if (nextRandom(s) >= effectivePickupRate) continue;
 
       const forceFloor = beltBagCount >= beltFloorTrigger;
+      recordPickByLap(s, bag);
       if (w.floorQueue.length + (w.activeFloor ? 1 : 0) < floorMax && (forceFloor || nextRandom(s) < floorDropProb)) {
         bag.state = 'floor'; bag.workerId = w.id;
         const ft = effectiveProcSeconds(w, bag.destination, speedOverride) + floorExtraTime;
@@ -1274,12 +1288,27 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.fillText(legLabel3, legLx3 + 20, legLy2);
   }
 
+  // 累計値（全便合計）をグラフ枠内の上端・右寄せで1行表示する
+  {
+    const totalDirect = s.workers.reduce((sum, wk) => sum + wk.doneCount, 0);
+    const [lap1, lap2, lap3] = s.pickByLap ?? [0, 0, 0];
+    const fmt = (v: number) => v.toLocaleString();
+    ctx.font = '16px sans-serif';
+    ctx.fillStyle = '#94A3B8';
+    ctx.textAlign = 'right'; ctx.textBaseline = 'top';
+    ctx.fillText(
+      `累床：${fmt(s.totalFloor)}　累直：${fmt(totalDirect)}　累１週：${fmt(lap1)}　累２週：${fmt(lap2)}　累３週以上：${fmt(lap3)}`,
+      x + w - 6, y + 4,
+    );
+  }
+
   // 便フィルタ適用中は、右パネルの統計（全便合算）とグラフの数値が一致しないことが分かるよう注記する
+  // （1段目右端は累計値の表示に使うため、2段目の右端に表示する）
   if (destFilter) {
     ctx.font = '16px sans-serif';
     ctx.fillStyle = '#FDE68A';
     ctx.textAlign = 'right'; ctx.textBaseline = 'top';
-    ctx.fillText(`表示中: 便名に「${destFilter.label}」を含む便のみ`, x + w - 8, y + 6);
+    ctx.fillText(`表示中: 便名に「${destFilter.label}」を含む便のみ`, x + w - 6, legLy2);
   }
 }
 
@@ -1485,126 +1514,223 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
   // 枠が隠れてしまわないよう、枠を常に最前面にするため）
   const drawStatsBoxes: (() => void)[] = [];
 
-  // ベルト上辺の作業者の上側・下辺の作業者の下側に、担当便の荷物が入る数のコンテナ（1基30個）＋けん引車を横並びで描く。
+  // ベルト上辺の作業者の上側・下辺の作業者の下側・右辺/左辺の作業者の外側に、担当便の荷物が入る数のコンテナ（1基30個）＋けん引車を並べて描く。
   // 上辺: 作業者アイコン上〜シーン上端の空き（約35px）、下辺: 作業者アイコン下〜ベルト下マージン端の空きに収め、
   // 既存レイアウト（SCENE_MARGIN_TOP / SCENE_MARGIN_BOTTOM_BELT等）は変えない。
   // 上辺は車が左端で左向き、下辺は左右反転して車が右端で右向き（右が進行方向）。
+  // 作業者番号の小さい順に1列目へ置き、先に置いた列と重なる場合は2列目（外側）へ置く（1便分は必ず同じ列。各列にけん引車）。
+  // 2列目を使う辺は外枠を超えないよう高さ方向だけ縮め、それでも入らなければ横方向も縮める。
   // 待ち行列の荷物が手前に見えるよう、作業者描画より先に描く。
   {
     const CONTAINER_CAPACITY = 30;
-    const CONTAINER_MAX_SIZE = 14; // コンテナの高さ（最大）
-    const CONTAINER_WIDTH_RATIO = 2; // コンテナの横幅＝高さ×2
-    const TUG_WIDTH_RATIO = 1.6; // けん引車の横幅＝コンテナの高さ×1.6
-    const TOWBAR_RATIO = 0.4; // 連結棒の長さ＝コンテナの高さ×0.4
+    const CONTAINER_MAX_SIZE = 14; // コンテナの基準サイズ（高さ・横方向の基準uの最大）
+    const CONTAINER_WIDTH_RATIO = 2; // コンテナの横幅＝u×2
+    const TUG_WIDTH_RATIO = 1.6; // けん引車の横幅＝u×1.6
+    const TOWBAR_RATIO = 0.4; // 連結棒の長さ＝u×0.4
     const CONTAINER_MIN_SIZE = 4;
     const CONTAINER_GAP = 3;
     const CONTAINER_BOTTOM_OFFSET = 30; // 上辺: 作業者中心からコンテナ列下端（車輪の下）までの距離（処理中の輪・待ち件数バッジと被らない）
     const CONTAINER_TOP_OFFSET_BOTTOM_SIDE = 33; // 下辺: 作業者中心からコンテナ上端までの距離（床仮置きの「床:n」ラベルと被らない）
-    const sideWorkers = (isTop: boolean) => workers
-      .filter(w => {
-        if (!w.visible) return false;
-        const { normal: [nx, ny] } = beltInfo(w.pos, s);
-        return Math.abs(ny) > Math.abs(nx) && (isTop ? ny < 0 : ny > 0);
-      })
-      .map(w => ({ w, xy: workerXY(w, s) }))
-      .sort((a, b) => a.xy[0] - b.xy[0]);
-    for (const isTop of [true, false]) {
-    const rowWorkers = sideWorkers(isTop);
-    rowWorkers.forEach(({ w, xy: [wx, wy] }, idx) => {
-      // 担当便ごとに「予定投入数÷30」の切り上げ基数のコンテナを並べ、その便に割り当てた色で、
-      // その作業者がその便を搭載済みの個数（直搭載＋床搭載）分を左のコンテナから30個ずつ塗る
-      const containers: { color: string | null; ratio: number }[] = [];
-      for (const d of w.assignedDests) {
-        const m = Math.ceil((destQuantities[d] ?? DEFAULT_DEST_QTY) / CONTAINER_CAPACITY);
-        const loadedD = w.loadedByDest?.[d] ?? 0;
-        for (let k = 0; k < m; k++) {
-          containers.push({
-            color: s.destColor?.[d] ?? null,
-            ratio: Math.max(0, Math.min(1, (loadedD - k * CONTAINER_CAPACITY) / CONTAINER_CAPACITY)),
-          });
-        }
-      }
-      const n = containers.length;
-      if (n <= 0) return;
-      // 同じ辺の隣の作業者のコンテナ列と重ならない幅（中心間距離 − 余白）に収める
-      const leftDist = idx > 0 ? wx - rowWorkers[idx - 1].xy[0] : Infinity;
-      const rightDist = idx < rowWorkers.length - 1 ? rowWorkers[idx + 1].xy[0] - wx : Infinity;
-      const availW = Math.min(leftDist, rightDist) - 6;
-      // コンテナは横長（横幅＝高さ×CONTAINER_WIDTH_RATIO）。size は高さ、cw は横幅。縮小時も縦横比を保つ
-      // 列の一番左にはコンテナをけん引する車（横幅＝高さ×TUG_WIDTH_RATIO）と連結棒（高さ×TOWBAR_RATIO）を付けるため、
-      // 重なり回避の幅計算にも含める
-      const fitSize = (availW - CONTAINER_GAP * (n - 1)) / (n * CONTAINER_WIDTH_RATIO + TUG_WIDTH_RATIO + TOWBAR_RATIO);
-      const size = Math.max(CONTAINER_MIN_SIZE, Math.min(CONTAINER_MAX_SIZE, fitSize));
-      const cw = size * CONTAINER_WIDTH_RATIO;
-      const tugW = size * TUG_WIDTH_RATIO;
-      const towbarW = size * TOWBAR_RATIO;
-      const gap = size < CONTAINER_MAX_SIZE ? Math.max(1, size * 0.2) : CONTAINER_GAP;
-      const rowW = tugW + towbarW + n * cw + (n - 1) * gap;
-      const rowLeft = wx - rowW / 2;
-      const containersLeft = rowLeft + tugW + towbarW;
-      // 車輪（コンテナ幅の約15%の半径）の分だけコンテナを上にずらし、待ち件数バッジ・処理中の輪と被らないようにする
-      const wheelR = Math.max(1, size * 0.15);
-      const y0 = isTop ? wy - CONTAINER_BOTTOM_OFFSET - wheelR * 2 - size : wy + CONTAINER_TOP_OFFSET_BOTTOM_SIDE;
-      ctx.save();
-      // 下辺は作業者中心の縦線を軸に左右反転して描く（車が右端・右向き、担当1便目のコンテナが車のすぐ左）。図形のみで文字はないため反転して問題ない
-      if (!isTop) { ctx.translate(wx, 0); ctx.scale(-1, 1); ctx.translate(-wx, 0); }
-      ctx.lineWidth = 1;
+    type BeltSide = 'top' | 'bottom' | 'right' | 'left';
+    type CItem = { color: string | null; ratio: number };
+    const sideOf = (nx: number, ny: number): BeltSide =>
+      Math.abs(ny) > Math.abs(nx) ? (ny < 0 ? 'top' : 'bottom') : (nx > 0 ? 'right' : 'left');
+    const ROW_GAP = 2;      // 2列にしたときの列と列の間隔
+    const TRAIN_MARGIN = 6; // 同じ列に並ぶ別の列（けん引車＋コンテナ）同士の最低間隔
+    const gapFor = (u: number) => (u < CONTAINER_MAX_SIZE ? Math.max(1, u * 0.2) : CONTAINER_GAP);
+    // u: 横方向の基準サイズ（コンテナ横幅＝u×CONTAINER_WIDTH_RATIO、けん引車＝u×TUG_WIDTH_RATIO 等）
+    const rowLen = (k: number, u: number) =>
+      u * (TUG_WIDTH_RATIO + TOWBAR_RATIO) + k * u * CONTAINER_WIDTH_RATIO + (k - 1) * gapFor(u);
 
-      // けん引車（左向き）: 背の低い車体＋後方（右寄り）の運転席（窓付き）＋車輪2つ。車輪下端はコンテナの車輪とそろえる
-      {
-        const bodyH = size * 0.5;
-        const bodyY = y0 + size - bodyH;
-        // 車の色は一番左のコンテナ（担当1便目）の便に割り当てた荷物の色。未割り当て（未投入）の間はグレー
-        ctx.fillStyle = containers[0].color ?? UNASSIGNED_DEST_COLOR;
-        ctx.fillRect(rowLeft, bodyY, tugW, bodyH);
-        const cabX = rowLeft + tugW * 0.5;
-        const cabW = tugW * 0.4;
-        const cabY = y0 + size * 0.1;
-        ctx.fillRect(cabX, cabY, cabW, bodyY - cabY);
-        ctx.fillStyle = '#BAE6FD';
-        const winPad = Math.max(0.5, size * 0.08);
-        ctx.fillRect(cabX + winPad, cabY + winPad, cabW - winPad * 2, Math.max(0.5, (bodyY - cabY) - winPad * 2));
-        ctx.strokeStyle = '#94A3B8';
-        ctx.strokeRect(rowLeft, bodyY, tugW, bodyH);
-        ctx.strokeRect(cabX, cabY, cabW, bodyY - cabY);
-        ctx.fillStyle = '#9CA3AF';
-        for (const tx of [rowLeft + tugW * 0.25, rowLeft + tugW * 0.75]) {
-          ctx.beginPath();
-          ctx.arc(tx, y0 + size + wheelR, wheelR, 0, Math.PI * 2);
-          ctx.fill();
+    for (const side of ['top', 'bottom', 'right', 'left'] as BeltSide[]) {
+      const isVerticalSide = side === 'right' || side === 'left';
+      // この辺の作業者（作業者番号が小さい順＝優先順）。担当便ごとに「予定投入数÷30」の切り上げ基数のコンテナを作り、
+      // その便に割り当てた色で、その作業者がその便を搭載済みの個数（直搭載＋床搭載）分を先頭のコンテナから30個ずつ塗る
+      const sideList = workers
+        .filter(w => {
+          if (!w.visible) return false;
+          const { normal: [nx, ny] } = beltInfo(w.pos, s);
+          return sideOf(nx, ny) === side;
+        })
+        .sort((a, b) => a.id - b.id)
+        .map(w => {
+          const flights: CItem[][] = w.assignedDests.map(d => {
+            const m = Math.ceil((destQuantities[d] ?? DEFAULT_DEST_QTY) / CONTAINER_CAPACITY);
+            const loadedD = w.loadedByDest?.[d] ?? 0;
+            return Array.from({ length: m }, (_, k) => ({
+              color: s.destColor?.[d] ?? null,
+              ratio: Math.max(0, Math.min(1, (loadedD - k * CONTAINER_CAPACITY) / CONTAINER_CAPACITY)),
+            }));
+          }).filter(f => f.length > 0);
+          const [wx, wy] = workerXY(w, s);
+          return { w, wx, wy, flights };
+        })
+        .filter(e => e.flights.length > 0);
+      if (sideList.length === 0) continue;
+
+      // 作業者の外側（上辺=上、下辺=下、右辺=右、左辺=左）で、シーン端（現状の外枠）までに使える奥行き（辺内の最小値）
+      const availOut = Math.min(...sideList.map(({ wx, wy }) => (
+        side === 'top' ? wy - layout.boxTop - CONTAINER_BOTTOM_OFFSET
+        : side === 'bottom' ? layout.beltAreaBottom - wy - CONTAINER_TOP_OFFSET_BOTTOM_SIDE
+        : side === 'right' ? layout.boxRight - wx - CONTAINER_BOTTOM_OFFSET
+        : wx - layout.boxLeft - CONTAINER_BOTTOM_OFFSET) - 1));
+      // 辺に沿った範囲の制限（右辺・左辺はシーンの上端〜下端に収める）
+      const alongMin = isVerticalSide ? layout.boxTop : -Infinity;
+      const alongMax = isVerticalSide ? layout.beltAreaBottom : Infinity;
+
+      type Placement = { e: typeof sideList[number]; lane: 0 | 1; items: CItem[] };
+      // 横方向サイズ u で、作業者番号順に1列目→2列目の空いている方へ置く。
+      // 作業者の全便を1列にまとめて置けなければ、便の区切り（コンテナ数がなるべく半分ずつ）で2列に分けて1列目・2列目に置く。
+      // 1便分は必ず同じ列。strict=false のときは入らない列も重なりが一番少ない列に置く（最終手段）
+      const tryLayout = (u: number, strict: boolean): Placement[] | null => {
+        const lanes: [number, number][][] = [[], []];
+        const overlapOf = (lane: 0 | 1, iv: [number, number]) => {
+          let ov = 0;
+          if (iv[0] < alongMin) ov += alongMin - iv[0];
+          if (iv[1] > alongMax) ov += iv[1] - alongMax;
+          for (const o of lanes[lane]) {
+            const d = Math.min(iv[1], o[1]) - Math.max(iv[0], o[0]) + TRAIN_MARGIN;
+            if (d > 0) ov += d;
+          }
+          return ov;
+        };
+        const res: Placement[] = [];
+        for (const e of sideList) {
+          const c = isVerticalSide ? e.wy : e.wx;
+          const iv = (k: number): [number, number] => [c - rowLen(k, u) / 2, c + rowLen(k, u) / 2];
+          const all = e.flights.flat();
+          const ivAll = iv(all.length);
+          const freeLane = ([0, 1] as const).find(l => overlapOf(l, ivAll) === 0);
+          if (freeLane !== undefined) {
+            lanes[freeLane].push(ivAll);
+            res.push({ e, lane: freeLane, items: all });
+            continue;
+          }
+          // 便の区切りで2列に分ける
+          let split: [CItem[], CItem[]] | null = null;
+          if (e.flights.length >= 2) {
+            let best = Infinity;
+            for (let b = 1; b < e.flights.length; b++) {
+              const a = e.flights.slice(0, b).flat(), bb = e.flights.slice(b).flat();
+              const diff = Math.abs(a.length - bb.length);
+              if (diff < best) { best = diff; split = [a, bb]; }
+            }
+          }
+          if (split) {
+            const [a, bb] = split;
+            const ivA = iv(a.length), ivB = iv(bb.length);
+            const order = ([[0, 1], [1, 0]] as const).find(([la, lb]) => overlapOf(la, ivA) === 0 && overlapOf(lb, ivB) === 0);
+            if (order) {
+              lanes[order[0]].push(ivA); lanes[order[1]].push(ivB);
+              res.push({ e, lane: order[0], items: a }, { e, lane: order[1], items: bb });
+              continue;
+            }
+          }
+          if (strict) return null;
+          // 最終手段: 全便1列のまま、重なりが一番少ない列に置く
+          const lane: 0 | 1 = overlapOf(0, ivAll) <= overlapOf(1, ivAll) ? 0 : 1;
+          lanes[lane].push(ivAll);
+          res.push({ e, lane, items: all });
         }
-        // 連結棒（けん引車の後端〜一番左のコンテナ）
-        ctx.strokeStyle = '#9CA3AF';
-        ctx.lineWidth = Math.max(1, size * 0.1);
-        ctx.beginPath();
-        ctx.moveTo(rowLeft + tugW, y0 + size * 0.8);
-        ctx.lineTo(containersLeft, y0 + size * 0.8);
-        ctx.stroke();
+        return res;
+      };
+      // 今の大きさで収まらなければ、横方向を少しずつ縮める（最小 CONTAINER_MIN_SIZE）
+      let u = CONTAINER_MAX_SIZE;
+      let placements = tryLayout(u, true);
+      while (!placements && u > CONTAINER_MIN_SIZE) {
+        u = Math.max(CONTAINER_MIN_SIZE, u - 1);
+        placements = tryLayout(u, true);
+      }
+      if (!placements) placements = tryLayout(u, false)!;
+
+      // 高さ: 2列目を使う列があれば、外枠を超えないよう辺全体の高さだけ縮めて2列を収める
+      // （1列の高さ＝h＋車輪(半径max(1, h×0.15))×2）
+      let h = u;
+      if (placements.some(pl => pl.lane === 1)) {
+        const perRow = (availOut - ROW_GAP) / 2;
+        let h2 = Math.min(CONTAINER_MAX_SIZE, perRow / 1.3);
+        if (h2 * 0.15 < 1) h2 = perRow - 2;
+        h = Math.max(3, Math.min(u, h2));
+      }
+      const wheelR = Math.max(1, h * 0.15);
+      const rowH = h + wheelR * 2;
+      const cw = u * CONTAINER_WIDTH_RATIO;
+      const tugW = u * TUG_WIDTH_RATIO;
+      const towbarW = u * TOWBAR_RATIO;
+      const gap = gapFor(u);
+
+      for (const { e, lane, items } of placements) {
+        const { wx, wy } = e;
+        ctx.save();
+        // 下辺は作業者中心の縦線を軸に左右反転して描く（車が右端・右向き、担当1便目のコンテナが車のすぐ左）。図形のみで文字はないため反転して問題ない
+        if (side === 'bottom') { ctx.translate(wx, 0); ctx.scale(-1, 1); ctx.translate(-wx, 0); }
+        // 右辺・左辺は上辺の絵を作業者中心で90°回転して描く（作業者の外側に縦方向。車輪はベルト側）。
+        // 右辺: +90°（車が上端・上向き）、左辺: −90°（車が下端・下向き）。上辺(左向き)→左辺(下向き)→下辺(右向き)→右辺(上向き)で一周する向き
+        if (isVerticalSide) { ctx.translate(wx, wy); ctx.rotate(side === 'right' ? Math.PI / 2 : -Math.PI / 2); ctx.translate(-wx, -wy); }
         ctx.lineWidth = 1;
-      }
 
-      for (let ci = 0; ci < n; ci++) {
-        const cx = containersLeft + ci * (cw + gap);
-        ctx.fillStyle = 'rgba(148,163,184,0.15)';
-        ctx.fillRect(cx, y0, cw, size);
-        const { color: fillColor, ratio: fillRatio } = containers[ci];
-        if (fillRatio > 0 && fillColor) {
-          const fillH = size * fillRatio;
-          ctx.fillStyle = fillColor;
-          ctx.fillRect(cx, y0 + size - fillH, cw, fillH);
-        }
-        ctx.strokeStyle = '#94A3B8';
-        ctx.strokeRect(cx, y0, cw, size);
-        // 車輪（コンテナ下辺の横幅1/4・3/4の位置に2つ）
-        ctx.fillStyle = '#9CA3AF';
-        for (const wxr of [cx + cw * 0.25, cx + cw * 0.75]) {
+        // 1列目（lane=0）が作業者に近い側、2列目はその外側。各列は作業者中心に左右対称
+        const y0 = side === 'bottom'
+          ? wy + CONTAINER_TOP_OFFSET_BOTTOM_SIDE + lane * (rowH + ROW_GAP)
+          : wy - CONTAINER_BOTTOM_OFFSET - lane * (rowH + ROW_GAP) - wheelR * 2 - h;
+        const rowLeft = wx - rowLen(items.length, u) / 2;
+        const containersLeft = rowLeft + tugW + towbarW;
+
+        // けん引車（左向き）: 背の低い車体＋後方（右寄り）の運転席（窓付き）＋車輪2つ。車輪下端はコンテナの車輪とそろえる
+        {
+          const bodyH = h * 0.5;
+          const bodyY = y0 + h - bodyH;
+          // 車の色はその列の先頭コンテナの便に割り当てた荷物の色。未割り当て（未投入）の間はグレー
+          ctx.fillStyle = items[0].color ?? UNASSIGNED_DEST_COLOR;
+          ctx.fillRect(rowLeft, bodyY, tugW, bodyH);
+          const cabX = rowLeft + tugW * 0.5;
+          const cabW = tugW * 0.4;
+          const cabY = y0 + h * 0.1;
+          ctx.fillRect(cabX, cabY, cabW, bodyY - cabY);
+          ctx.fillStyle = '#BAE6FD';
+          const winPad = Math.max(0.5, Math.min(u, h) * 0.08);
+          ctx.fillRect(cabX + winPad, cabY + winPad, Math.max(0.5, cabW - winPad * 2), Math.max(0.5, (bodyY - cabY) - winPad * 2));
+          ctx.strokeStyle = '#94A3B8';
+          ctx.strokeRect(rowLeft, bodyY, tugW, bodyH);
+          ctx.strokeRect(cabX, cabY, cabW, bodyY - cabY);
+          ctx.fillStyle = '#9CA3AF';
+          for (const tx of [rowLeft + tugW * 0.25, rowLeft + tugW * 0.75]) {
+            ctx.beginPath();
+            ctx.arc(tx, y0 + h + wheelR, wheelR, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          // 連結棒（けん引車の後端〜その列の先頭コンテナ）
+          ctx.strokeStyle = '#9CA3AF';
+          ctx.lineWidth = Math.max(1, h * 0.1);
           ctx.beginPath();
-          ctx.arc(wxr, y0 + size + wheelR, wheelR, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.moveTo(rowLeft + tugW, y0 + h * 0.8);
+          ctx.lineTo(containersLeft, y0 + h * 0.8);
+          ctx.stroke();
+          ctx.lineWidth = 1;
         }
+
+        for (let ci = 0; ci < items.length; ci++) {
+          const cx = containersLeft + ci * (cw + gap);
+          ctx.fillStyle = 'rgba(148,163,184,0.15)';
+          ctx.fillRect(cx, y0, cw, h);
+          const { color: fillColor, ratio: fillRatio } = items[ci];
+          if (fillRatio > 0 && fillColor) {
+            const fillH = h * fillRatio;
+            ctx.fillStyle = fillColor;
+            ctx.fillRect(cx, y0 + h - fillH, cw, fillH);
+          }
+          ctx.strokeStyle = '#94A3B8';
+          ctx.strokeRect(cx, y0, cw, h);
+          // 車輪（コンテナ下辺の横幅1/4・3/4の位置に2つ）
+          ctx.fillStyle = '#9CA3AF';
+          for (const wxr of [cx + cw * 0.25, cx + cw * 0.75]) {
+            ctx.beginPath();
+            ctx.arc(wxr, y0 + h + wheelR, wheelR, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+        ctx.restore();
       }
-      ctx.restore();
-    });
     }
   }
 
@@ -1706,7 +1832,7 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     const totalAssigned = w.assignedDests.reduce(
       (sum, d) => sum + (destQuantities[d] ?? DEFAULT_DEST_QTY), 0
     );
-    const floorActive = w.floorQueue.length;
+    const floorActive = w.floorQueue.length + (w.activeFloor ? 1 : 0); // 床で処理中の1個も含める（床置きの荷物アイコン・「床:n」と同じ数え方）
     const isVerticalWorker = Math.abs(ny) > Math.abs(nx);
     const compact = workers.length > 6;
 
@@ -1770,19 +1896,24 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     ctx.shadowColor = bag.color; ctx.shadowBlur = 5;
     ctx.fillRect(-s.bagW / 2, -s.bagH / 2, s.bagW, s.bagH);
     ctx.strokeRect(-s.bagW / 2, -s.bagH / 2, s.bagW, s.bagH);
+    // 周回マーク（荷物アイコンの真ん中に、はみ出ない最大サイズで描く）: 2周目(circuits=1)は△、3周目以上(circuits>=2)は×。
+    // 記号の色は黒。荷物の色が黒だと見づらい濃い色（LAP_MARK_LIGHT_ON_BAG_COLORS）のときだけ白にする
     if (bag.circuits > 0) {
-      if (bag.circuits >= 3) {
-        const cx = s.bagW / 2 - 3, cy = -s.bagH / 2 + 3, sz = 2.5;
-        ctx.strokeStyle = '#EF4444'; ctx.lineWidth = 1.8;
+      ctx.shadowBlur = 0;
+      const markColor = LAP_MARK_LIGHT_ON_BAG_COLORS.has(bag.color.toUpperCase()) ? '#FFFFFF' : '#000000';
+      const hw = s.bagW / 2 - 0.8, hh = s.bagH / 2 - 0.8; // 荷物の枠線(0.8)の内側
+      if (bag.circuits >= 2) {
+        const lw = 1.8;
+        const ix = hw - lw / 2, iy = hh - lw / 2;
+        ctx.strokeStyle = markColor; ctx.lineWidth = lw;
         ctx.beginPath();
-        ctx.moveTo(cx - sz, cy - sz); ctx.lineTo(cx + sz, cy + sz);
-        ctx.moveTo(cx + sz, cy - sz); ctx.lineTo(cx - sz, cy + sz);
+        ctx.moveTo(-ix, -iy); ctx.lineTo(ix, iy);
+        ctx.moveTo(ix, -iy); ctx.lineTo(-ix, iy);
         ctx.stroke();
       } else {
-        const tx = s.bagW / 2 - 3, ty = -s.bagH / 2 + 4;
-        ctx.fillStyle = '#EAB308';
+        ctx.fillStyle = markColor;
         ctx.beginPath();
-        ctx.moveTo(tx, ty - 3.5); ctx.lineTo(tx - 3.5, ty + 2.5); ctx.lineTo(tx + 3.5, ty + 2.5);
+        ctx.moveTo(0, -hh); ctx.lineTo(-hw, hh); ctx.lineTo(hw, hh);
         ctx.closePath(); ctx.fill();
       }
     }
@@ -1791,6 +1922,49 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
 
   // シーン変換（ベルト＋作業者＋グラフの一括縮小）をここで終了。以降は実キャンバス座標系で固定表示。
   ctx.restore();
+
+  // 周回マークの凡例＋現在ベルト上の該当荷物数（リアルタイム）を、キャンバス右上の枠ぎりぎり（SCENE_OUTER_MARGIN）に表示
+  {
+    const lap2 = bags.filter(b => b.state === 'belt' && b.circuits === 1).length;
+    const lap3 = bags.filter(b => b.state === 'belt' && b.circuits >= 2).length;
+    const lines = [
+      { mark: 'tri' as const, text: `2周目の荷物 ${lap2}個` },
+      { mark: 'x' as const, text: `3周目以上 ${lap3}個` },
+    ];
+    ctx.save();
+    ctx.font = 'bold 13px sans-serif';
+    const markW = 12, markGap = 6, padX = 8, padY = 6, lineH = 18;
+    const textW = Math.max(...lines.map(l => ctx.measureText(l.text).width));
+    const boxW = padX * 2 + markW + markGap + textW;
+    const boxH = padY * 2 + lineH * lines.length;
+    const boxX = SW - SCENE_OUTER_MARGIN - boxW;
+    const boxY = SCENE_OUTER_MARGIN;
+    ctx.fillStyle = 'rgba(17,24,39,0.85)';
+    ctx.beginPath(); ctx.roundRect(boxX, boxY, boxW, boxH, 5); ctx.fill();
+    ctx.strokeStyle = 'rgba(75,85,99,0.7)'; ctx.lineWidth = 0.8;
+    ctx.beginPath(); ctx.roundRect(boxX, boxY, boxW, boxH, 5); ctx.stroke();
+    lines.forEach((l, i) => {
+      const cy = boxY + padY + lineH * i + lineH / 2;
+      const mx = boxX + padX + markW / 2;
+      const r = markW / 2 - 1;
+      if (l.mark === 'tri') {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.beginPath();
+        ctx.moveTo(mx, cy - r); ctx.lineTo(mx - r, cy + r); ctx.lineTo(mx + r, cy + r);
+        ctx.closePath(); ctx.fill();
+      } else {
+        ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(mx - r, cy - r); ctx.lineTo(mx + r, cy + r);
+        ctx.moveTo(mx + r, cy - r); ctx.lineTo(mx - r, cy + r);
+        ctx.stroke();
+      }
+      ctx.fillStyle = '#E5E7EB';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(l.text, boxX + padX + markW + markGap, cy);
+    });
+    ctx.restore();
+  }
 }
 
 // ── Simulation speed options ─────────────────────────────────
@@ -3112,8 +3286,8 @@ export default function BaggageSimulation() {
           })}
           <div className="mt-3 pt-3 border-t border-gray-700 text-xs text-gray-500 space-y-1">
             <div>■ 濃色: 待ちキュー　■ 淡色: 床仮置き</div>
-            <div>△ 黄: 2周目の荷物</div>
-            <div>× 赤: 3周目以上</div>
+            <div>△ 2周目の荷物</div>
+            <div>× 3周目以上</div>
             <div>床仮置き: 処理速度+{floorExtraTime}秒・最大{floorMax}個</div>
           </div>
         </div>
