@@ -83,8 +83,8 @@ const TUG_DRAW_SCALE = 1.3; // けん引車の描画サイズの拡大率（コ�
 
 // ── けん引車の出発演出（表示専用。シミュレーション計算には影響しない）────────────
 // 作業者の担当便がすべて完了（destCompletionTime 記録済み）したら、コンテナ列が実時間で
-// 「ピッピッ」の吹き出し → 進行方向へ少し移動 → フェイドアウト の順に演出して消える。
-const DEPART_BUZZ_MS = 2000; // 吹き出し「ピッピッ」を出す時間
+// 「ブッブッ」の吹き出し → 進行方向へ少し移動 → フェイドアウト の順に演出して消える。
+const DEPART_BUZZ_MS = 2000; // 吹き出し「ブッブッ」を出す時間
 const DEPART_MOVE_MS = 1000; // 進行方向へ動く時間
 const DEPART_FADE_MS = 2000; // フェイドアウトの時間
 const DEPART_TOTAL_MS = DEPART_BUZZ_MS + DEPART_MOVE_MS + DEPART_FADE_MS;
@@ -1790,7 +1790,7 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
   // 作業者番号の小さい順に1列目へ置き、先に置いた列と重なる場合は2列目（外側）へ置く（1便分は必ず同じ列。各列にけん引車）。
   // コンテナは便数が増えて1列目・2列目で重なっても縮小しない（常に基準サイズ。重なり・外枠からのはみ出しは許容）。
   // 待ち行列の荷物が手前に見えるよう、作業者描画より先に描く。
-  // 出発演出の吹き出し「ピッピッ」は、作業者アイコンなどに隠れないようシーンの最後にまとめて描く
+  // 出発演出の吹き出し「ブッブッ」は、作業者アイコンなどに隠れないようシーンの最後にまとめて描く
   const departBubbles: { x: number; y: number }[] = [];
   {
     // コンテナの寸法（CONTAINER_CAPACITY / CONTAINER_MAX_SIZE / *_RATIO / CONTAINER_GAP / TRAIN_MARGIN）はファイル先頭で定義
@@ -2382,11 +2382,11 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     ctx.restore();
   }
 
-  // 出発演出の吹き出し「ピッピッ」（けん引車の上。文字は正立）
+  // 出発演出の吹き出し「ブッブッ」（けん引車の上。文字は正立）
   for (const b of departBubbles) {
     ctx.save();
     ctx.font = 'bold 24px sans-serif';
-    const text = 'ピッピッ';
+    const text = 'ブッブッ';
     const tw = ctx.measureText(text).width;
     const bw = tw + 20, bh = 36;
     const TAIL = 12, GAP = 22; // しっぽの長さ・けん引車中心から吹き出し本体までの距離
@@ -3255,7 +3255,7 @@ export default function BaggageSimulation() {
                 <span className="text-xs text-red-400 max-w-xs truncate" title={deployMessage}>{deployMessage}</span>
               )}
               {deployPhase === 'done' && (
-                <span className="text-xs text-emerald-400 leading-tight">本番まで<br />数分かかります</span>
+                <span className="text-xs text-emerald-400 leading-tight">URL反映に<br />数分かかります</span>
               )}
             </div>
           )}
