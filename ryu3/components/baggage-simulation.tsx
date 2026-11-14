@@ -3185,16 +3185,27 @@ export default function BaggageSimulation() {
             空港手荷物処理能力<br />シミュレーション
           </h1>
         </div>
-        {/* 右上: バージョン表記（最終pushの日時）を右寄せで置き、その下にボタン列を並べる */}
-        <div className="flex flex-col items-end gap-1">
+        {/* 右上: 1行目は左端に読み込んだエクセルファイル名（pushボタンの真上）、右端にバージョン表記（最終pushの日時）。
+            その下にボタン列を並べる */}
+        <div className="flex flex-col items-stretch gap-1">
+          <div className="flex items-baseline justify-between gap-3 min-w-0">
+            {injectionRuleId === 'excel-import' && excelFileName ? (
+              <span
+                className="text-[16.5px] font-light text-gray-500 truncate max-w-[480px]"
+                title={excelFileName}
+              >
+                {excelFileName}
+              </span>
+            ) : <span />}
             {BUILD_VERSION_LABEL && (
               <span
-                className="text-[11px] font-light text-gray-500"
+                className="text-[16.5px] font-light text-gray-500 whitespace-nowrap"
                 title="最終pushの日時（JST）"
               >
                 {BUILD_VERSION_LABEL}
               </span>
             )}
+          </div>
         <div className="flex gap-2 items-center">
           {process.env.NODE_ENV === 'development' && (
             <div className="flex items-center gap-2">
@@ -3231,7 +3242,7 @@ export default function BaggageSimulation() {
                 <span className="text-xs text-red-400 max-w-xs truncate" title={deployMessage}>{deployMessage}</span>
               )}
               {deployPhase === 'done' && (
-                <span className="text-xs text-emerald-400">本番まで数分かかります</span>
+                <span className="text-xs text-emerald-400 leading-tight">本番まで<br />数分かかります</span>
               )}
             </div>
           )}
