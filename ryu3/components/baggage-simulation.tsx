@@ -97,6 +97,8 @@ interface DepartAnimState {
   startMs: Map<number, number>; // 作業者id → 出発演出の開始時刻(ms)
   lastDepartedFlights: number; // 前回の総出発便数（増えたら「Good Flight」ポップを出す）
   popStartMs: number | null; // 直近の「Good Flight」ポップの開始時刻(ms)
+  lastState: SimState | null; // 前回表示した状態（別の時点へ飛んだかの判定用）
+  lastTime: number; // 前回表示した状態のシミュレーション時刻
 }
 
 // 作業者の担当便（予定投入数が1以上の便）がすべて完了しているか（＝けん引車が出発する条件）
@@ -124,19 +126,28 @@ function countDepartedFlights(s: SimState, destQuantities: number[], anim: Depar
   return n;
 }
 // 表示する状態に合わせて出発演出の開始時刻を更新する。完了した作業者は初めて見えた時刻から演出を始め、
-// 巻き戻し・リセットで完了前に戻った作業者は演出を取り消す
+// 巻き戻し・リセットで完了前に戻った作業者は演出を取り消す。
+// タイムラインのバー操作・「搭載終了」の一括計算・リセットなどで表示する状態が別の時点へ飛んだときは、
+// 演出を省いてその時点で完了済みの列を即座に「出発済み」にする（総出発便数がバーと即座に連動する。ポップも出さない）。
+// 通常再生中（同じ状態オブジェクトを更新し続ける）と、全搭載完了で最終スナップショットへ切り替わる瞬間（同時刻）は演出する
 function updateDepartAnim(s: SimState, destQuantities: number[], a: DepartAnimState, now: number) {
   a.now = now;
+  const jumped = a.lastState !== null && s !== a.lastState && Math.abs(s.time - a.lastTime) > 1e-6;
+  a.lastState = s;
+  a.lastTime = s.time;
   const ids = new Set<number>();
   for (const w of s.workers) {
     ids.add(w.id);
     const done = isWorkerLoadComplete(s, w, destQuantities);
-    if (done && !a.startMs.has(w.id)) a.startMs.set(w.id, now);
-    else if (!done && a.startMs.has(w.id)) a.startMs.delete(w.id);
+    if (done && (jumped || !a.startMs.has(w.id))) {
+      if (jumped) a.startMs.set(w.id, now - DEPART_TOTAL_MS);
+      else a.startMs.set(w.id, now);
+    } else if (!done && a.startMs.has(w.id)) a.startMs.delete(w.id);
   }
   for (const id of [...a.startMs.keys()]) if (!ids.has(id)) a.startMs.delete(id);
   const departed = countDepartedFlights(s, destQuantities, a);
-  if (departed > a.lastDepartedFlights) a.popStartMs = now;
+  if (!jumped && departed > a.lastDepartedFlights) a.popStartMs = now;
+  if (jumped) a.popStartMs = null;
   a.lastDepartedFlights = departed;
 }
 const CONTAINER_GAP = 3; // コンテナ同士の間隔（基準サイズ時）
@@ -2410,9 +2421,11 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
   // シーン変換（ベルト＋作業者＋グラフの一括縮小）をここで終了。以降は実キャンバス座標系で固定表示。
   ctx.restore();
 
-  // 総出発便数（グラフ枠の外の右上。グラフ上端の高さに右寄せで「総出発便数 ○便 ✈」）と「Good Flight」ポップ
+  // 総出発便数（グラフ枠の外の右上。グラフ上端の高さに右寄せで「総出発便数 ○/総受託便数便 ✈」）と「Good Flight」ポップ
   {
     const departed = countDepartedFlights(s, destQuantities, departAnim);
+    // 総受託便数: 全作業者の担当便のうち予定投入数が1以上の便の数（出発便数と同じ数え方）
+    const totalFlights = s.workers.reduce((sum, w) => sum + workerFlightCount(w, destQuantities), 0);
     const rightX = SW - SCENE_OUTER_MARGIN;
     const rowY = layout.chartFinal.y + 14; // 行の中心
     const planeW = 24;
@@ -2434,11 +2447,11 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     ctx.save();
     ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
     ctx.font = 'bold 18px sans-serif'; ctx.fillStyle = '#FDE68A';
-    const valueText = `${departed}便`;
+    const valueText = `${departed}/${totalFlights}便`;
     const valueRight = rightX - planeW - 6;
     ctx.fillText(valueText, valueRight, rowY);
     const valueW = ctx.measureText(valueText).width;
-    ctx.font = 'bold 15px sans-serif'; ctx.fillStyle = '#94A3B8';
+    ctx.font = 'bold 15px sans-serif'; ctx.fillStyle = '#FDE68A'; // ラベルも便数と同じ黄色
     ctx.fillText('総出発便数', valueRight - valueW - 8, rowY);
     // 「Good Flight」ポップ（便数が増えるたびに飛行機アイコンの上へ浮かびながら消える）
     if (departAnim && departAnim.popStartMs !== null) {
@@ -2515,7 +2528,7 @@ export default function BaggageSimulation() {
   // 通常再生と搭載終了は必ずこの同じ値を使うことで、同じ回の中では常に一致する結果になる。
   const activeSeedRef         = useRef<number>(SIM_RNG_SEED);
   // けん引車の出発演出の状態（表示専用。描画ループで updateDepartAnim により更新する）
-  const departAnimRef         = useRef<DepartAnimState>({ now: 0, startMs: new Map(), lastDepartedFlights: 0, popStartMs: null });
+  const departAnimRef         = useRef<DepartAnimState>({ now: 0, startMs: new Map(), lastDepartedFlights: 0, popStartMs: null, lastState: null, lastTime: 0 });
 
   const [running, setRunning]             = useState(false);
   const [hasStarted, setHasStarted]       = useState(false);
