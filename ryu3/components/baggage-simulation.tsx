@@ -80,6 +80,65 @@ const CONTAINER_WIDTH_RATIO = 2; // コンテナの横幅＝u×2
 const TUG_WIDTH_RATIO = 1.6; // けん引車の横幅＝u×1.6
 const TOWBAR_RATIO = 0.4; // 連結棒の長さ＝u×0.4
 const TUG_DRAW_SCALE = 1.3; // けん引車の描画サイズの拡大率（コンテナの基準サイズに対して。配置計算の列の長さには含めない）
+
+// ── けん引車の出発演出（表示専用。シミュレーション計算には影響しない）────────────
+// 作業者の担当便がすべて完了（destCompletionTime 記録済み）したら、コンテナ列が実時間で
+// 「ピッピッ」の吹き出し → 進行方向へ少し移動 → フェイドアウト の順に演出して消える。
+const DEPART_BUZZ_MS = 2000; // 吹き出し「ピッピッ」を出す時間
+const DEPART_MOVE_MS = 1000; // 進行方向へ動く時間
+const DEPART_FADE_MS = 2000; // フェイドアウトの時間
+const DEPART_TOTAL_MS = DEPART_BUZZ_MS + DEPART_MOVE_MS + DEPART_FADE_MS;
+const DEPART_MOVE_PX = CONTAINER_MAX_SIZE * TUG_WIDTH_RATIO * TUG_DRAW_SCALE * 1.5; // 動く距離（けん引車1台半分）
+const GOOD_FLIGHT_POP_MS = 1500; // 「Good Flight」ポップの表示時間
+
+// 出発演出の状態（コンポーネントの useRef に保持し、描画ループで updateDepartAnim により更新する）
+interface DepartAnimState {
+  now: number; // 現在の実時間(ms, performance.now)
+  startMs: Map<number, number>; // 作業者id → 出発演出の開始時刻(ms)
+  lastDepartedFlights: number; // 前回の総出発便数（増えたら「Good Flight」ポップを出す）
+  popStartMs: number | null; // 直近の「Good Flight」ポップの開始時刻(ms)
+}
+
+// 作業者の担当便（予定投入数が1以上の便）がすべて完了しているか（＝けん引車が出発する条件）
+function isWorkerLoadComplete(s: SimState, w: WorkerDef, destQuantities: number[]): boolean {
+  const ds = w.assignedDests.filter(d => (destQuantities[d] ?? DEFAULT_DEST_QTY) > 0);
+  return ds.length > 0 && ds.every(d => s.destCompletionTime[d] !== null && s.destCompletionTime[d] !== undefined);
+}
+function workerFlightCount(w: WorkerDef, destQuantities: number[]): number {
+  return w.assignedDests.filter(d => (destQuantities[d] ?? DEFAULT_DEST_QTY) > 0).length;
+}
+// 出発演出の経過時間(ms)。積み込み中は null。演出情報がない（ピーク時キャプチャ等）ときは演出済み扱い
+function departElapsedMs(s: SimState, w: WorkerDef, destQuantities: number[], anim: DepartAnimState | null): number | null {
+  if (!isWorkerLoadComplete(s, w, destQuantities)) return null;
+  if (!anim) return DEPART_TOTAL_MS;
+  const st = anim.startMs.get(w.id);
+  return st === undefined ? 0 : Math.max(0, anim.now - st);
+}
+// 総出発便数（フェイドアウトまで終わった列が担当していた便数の合計）
+function countDepartedFlights(s: SimState, destQuantities: number[], anim: DepartAnimState | null): number {
+  let n = 0;
+  for (const w of s.workers) {
+    const t = departElapsedMs(s, w, destQuantities, anim);
+    if (t !== null && t >= DEPART_TOTAL_MS) n += workerFlightCount(w, destQuantities);
+  }
+  return n;
+}
+// 表示する状態に合わせて出発演出の開始時刻を更新する。完了した作業者は初めて見えた時刻から演出を始め、
+// 巻き戻し・リセットで完了前に戻った作業者は演出を取り消す
+function updateDepartAnim(s: SimState, destQuantities: number[], a: DepartAnimState, now: number) {
+  a.now = now;
+  const ids = new Set<number>();
+  for (const w of s.workers) {
+    ids.add(w.id);
+    const done = isWorkerLoadComplete(s, w, destQuantities);
+    if (done && !a.startMs.has(w.id)) a.startMs.set(w.id, now);
+    else if (!done && a.startMs.has(w.id)) a.startMs.delete(w.id);
+  }
+  for (const id of [...a.startMs.keys()]) if (!ids.has(id)) a.startMs.delete(id);
+  const departed = countDepartedFlights(s, destQuantities, a);
+  if (departed > a.lastDepartedFlights) a.popStartMs = now;
+  a.lastDepartedFlights = departed;
+}
 const CONTAINER_GAP = 3; // コンテナ同士の間隔（基準サイズ時）
 const TRAIN_MARGIN = 6; // 同じ列に並ぶ別の列（けん引車＋コンテナ）同士の最低間隔
 // 基準サイズでコンテナk基を1列に並べたときの列の長さ（けん引車＋連結棒込み、px・等倍時）
@@ -1567,7 +1626,7 @@ function drawStatsPanel(ctx: CanvasRenderingContext2D, s: SimState, simSpeed: nu
 }
 
 // ── Draw simulation canvas ───────────────────────────────────
-function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean, chartSeriesVisible: ChartSeriesVisible, chartDestFilter: ChartDestFilter | null = null, speedOverrideSeconds: number | null = null, nominalLaneCapacityTotal: number | null = null) {
+function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean, chartSeriesVisible: ChartSeriesVisible, chartDestFilter: ChartDestFilter | null = null, speedOverrideSeconds: number | null = null, nominalLaneCapacityTotal: number | null = null, departAnim: DepartAnimState | null = null) {
   const { workers, bags, beltW: BW, beltH: BH, beltR: BR, beltWidthPx } = s;
 
   ctx.fillStyle = '#111827';
@@ -1705,6 +1764,8 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
   // 作業者番号の小さい順に1列目へ置き、先に置いた列と重なる場合は2列目（外側）へ置く（1便分は必ず同じ列。各列にけん引車）。
   // コンテナは便数が増えて1列目・2列目で重なっても縮小しない（常に基準サイズ。重なり・外枠からのはみ出しは許容）。
   // 待ち行列の荷物が手前に見えるよう、作業者描画より先に描く。
+  // 出発演出の吹き出し「ピッピッ」は、作業者アイコンなどに隠れないようシーンの最後にまとめて描く
+  const departBubbles: { x: number; y: number }[] = [];
   {
     // コンテナの寸法（CONTAINER_CAPACITY / CONTAINER_MAX_SIZE / *_RATIO / CONTAINER_GAP / TRAIN_MARGIN）はファイル先頭で定義
     const CONTAINER_BOTTOM_OFFSET = 30; // 上辺: 作業者中心からコンテナ列下端（車輪の下）までの距離（処理中の輪・待ち件数バッジと被らない）
@@ -1723,9 +1784,14 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
       const isVerticalSide = side === 'right' || side === 'left';
       // この辺の作業者（作業者番号が小さい順＝優先順）。担当便ごとに「予定投入数÷30」の切り上げ基数のコンテナを作り、
       // その便に割り当てた色で、その作業者がその便を搭載済みの個数（直搭載＋床搭載）分を先頭のコンテナから30個ずつ塗る
+      // エクセル読み込みで非表示になった作業者も、担当便の投入が始まっていれば出発演出が終わるまで列を残す（描画のみ）。
+      // 出発演出が終わった列は描かない
       const sideList = workers
         .filter(w => {
-          if (!w.visible) return false;
+          const started = w.assignedDests.some(d => s.destFirstSpawnTime[d] !== null && s.destFirstSpawnTime[d] !== undefined);
+          if (!w.visible && !started) return false;
+          const el = departElapsedMs(s, w, destQuantities, departAnim);
+          if (el !== null && el >= DEPART_TOTAL_MS) return false;
           const { normal: [nx, ny] } = beltInfo(w.pos, s);
           return sideOf(nx, ny) === side;
         })
@@ -1820,12 +1886,20 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
 
       for (const { e, lane, items } of placements) {
         const { wx, wy } = e;
+        // 出発演出: 吹き出しの後、進行方向（列の描画座標で左＝けん引車の向き）へ少し動き、その後フェイドアウトする
+        const departEl = departElapsedMs(s, e.w, destQuantities, departAnim);
+        const departMoveT = departEl === null ? 0 : Math.min(1, Math.max(0, (departEl - DEPART_BUZZ_MS) / DEPART_MOVE_MS));
+        const departOff = DEPART_MOVE_PX * departMoveT * departMoveT * (3 - 2 * departMoveT); // なめらかに加減速
+        const departAlpha = departEl === null ? 1
+          : 1 - Math.min(1, Math.max(0, (departEl - DEPART_BUZZ_MS - DEPART_MOVE_MS) / DEPART_FADE_MS));
         ctx.save();
         // 下辺は作業者中心の縦線を軸に左右反転して描く（車が右端・右向き、担当1便目のコンテナが車のすぐ左）。図形のみで文字はないため反転して問題ない
         if (side === 'bottom') { ctx.translate(wx, 0); ctx.scale(-1, 1); ctx.translate(-wx, 0); }
         // 右辺・左辺は上辺の絵を作業者中心で90°回転して描く（作業者の外側に縦方向。車輪はベルト側）。
         // 右辺: +90°（車が上端・上向き）、左辺: −90°（車が下端・下向き）。上辺(左向き)→左辺(下向き)→下辺(右向き)→右辺(上向き)で一周する向き
         if (isVerticalSide) { ctx.translate(wx, wy); ctx.rotate(side === 'right' ? Math.PI / 2 : -Math.PI / 2); ctx.translate(-wx, -wy); }
+        ctx.translate(-departOff, 0);
+        ctx.globalAlpha = departAlpha;
         ctx.lineWidth = 1;
 
         // 1列目（lane=0）が作業者に近い側、2列目はその外側。各列は作業者中心に左右対称
@@ -1906,14 +1980,16 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
           const tWheelR = Math.max(1, tH * 0.15);
           const tugLeft = rowLeft + tugW - tTugW;
           const tY0 = y0 + h + wheelR * 2 - tWheelR * 2 - tH;
-          const lx = tugLeft + tTugW / 2 - wx;
+          const lx = tugLeft + tTugW / 2 - wx - departOff;
           const ly = tY0 + tH / 2 - wy;
           let nxp = wx + lx, nyp = wy + ly;
           if (side === 'bottom') { nxp = wx - lx; }
           else if (side === 'right') { nxp = wx - ly; nyp = wy + lx; }
           else if (side === 'left') { nxp = wx + ly; nyp = wy - lx; }
           const no = String(e.w.id + 1);
+          if (departEl !== null && departEl < DEPART_BUZZ_MS) departBubbles.push({ x: nxp, y: nyp });
           ctx.save();
+          ctx.globalAlpha = departAlpha;
           ctx.font = 'bold 11px sans-serif';
           ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
           ctx.lineJoin = 'round'; ctx.lineWidth = 2.5; ctx.strokeStyle = '#FFFFFF';
@@ -2228,7 +2304,10 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     ctx.font = `bold ${LAP_LEGEND_FONT_PX}px sans-serif`;
     const markW = 12, markGap = 5, itemGap = 16, padX = 8;
     const itemWs = items.map(it => markW + markGap + ctx.measureText(it.text).width);
-    const boxW = padX * 2 + itemWs.reduce((a, b) => a + b, 0) + itemGap * (items.length - 1);
+    // 凡例の一番左に「手荷物」を表示する（文字幅を実測して枠の幅に含め、枠内に収める）
+    const headLabel = '手荷物';
+    const headW = ctx.measureText(headLabel).width;
+    const boxW = padX * 2 + headW + itemGap + itemWs.reduce((a, b) => a + b, 0) + itemGap * (items.length - 1);
     const boxH = LAP_LEGEND_BOX_H;
     // 基準寸法の LAP_LEGEND_SCALE 倍で描き、内周に収まらないときはさらに縮小する
     const k = LAP_LEGEND_SCALE * Math.min(inner.legendScaleH, inner.legendMaxW / (boxW * LAP_LEGEND_SCALE));
@@ -2238,7 +2317,10 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     ctx.beginPath(); ctx.roundRect(boxX, boxY, boxW, boxH, 5); ctx.fill();
     ctx.strokeStyle = 'rgba(75,85,99,0.7)'; ctx.lineWidth = 0.8;
     ctx.beginPath(); ctx.roundRect(boxX, boxY, boxW, boxH, 5); ctx.stroke();
-    let cx = boxX + padX;
+    ctx.fillStyle = '#E5E7EB';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(headLabel, boxX + padX, 0);
+    let cx = boxX + padX + headW + itemGap;
     items.forEach((it, i) => {
       const mx = cx + markW / 2;
       const r = markW / 2 - 1;
@@ -2274,8 +2356,79 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     ctx.restore();
   }
 
+  // 出発演出の吹き出し「ピッピッ」（けん引車の上。文字は正立）
+  for (const b of departBubbles) {
+    ctx.save();
+    ctx.font = 'bold 24px sans-serif';
+    const text = 'ピッピッ';
+    const tw = ctx.measureText(text).width;
+    const bw = tw + 20, bh = 36;
+    const bx0 = b.x - bw / 2, by0 = b.y - 22 - bh; // 吹き出しの下端（しっぽの付け根）をけん引車中心の22px上に
+    ctx.fillStyle = '#FFFFFF'; ctx.strokeStyle = '#1F2937'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.roundRect(bx0, by0, bw, bh, 12); ctx.fill(); ctx.stroke();
+    // しっぽ（けん引車に向けた三角）
+    ctx.beginPath();
+    ctx.moveTo(b.x - 8, by0 + bh - 0.75); ctx.lineTo(b.x, by0 + bh + 12); ctx.lineTo(b.x + 8, by0 + bh - 0.75);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(b.x - 8, by0 + bh); ctx.lineTo(b.x, by0 + bh + 12); ctx.lineTo(b.x + 8, by0 + bh); ctx.stroke();
+    ctx.fillStyle = '#DC2626';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, b.x, by0 + bh / 2 + 0.5);
+    ctx.restore();
+  }
+
   // シーン変換（ベルト＋作業者＋グラフの一括縮小）をここで終了。以降は実キャンバス座標系で固定表示。
   ctx.restore();
+
+  // 総出発便数（グラフ枠の外の右上。グラフ上端の高さに右寄せで「総出発便数 ○便 ✈」）と「Good Flight」ポップ
+  {
+    const departed = countDepartedFlights(s, destQuantities, departAnim);
+    const rightX = SW - SCENE_OUTER_MARGIN;
+    const rowY = layout.chartFinal.y + 14; // 行の中心
+    const planeW = 24;
+    const planeCx = rightX - planeW / 2;
+    ctx.save();
+    // 飛行機アイコン（右向き。図形で描く）
+    ctx.translate(planeCx, rowY);
+    ctx.fillStyle = '#60A5FA';
+    ctx.beginPath();
+    ctx.moveTo(12, 0);            // 機首
+    ctx.lineTo(8, -2); ctx.lineTo(2, -2);
+    ctx.lineTo(-4, -11); ctx.lineTo(-7, -11); ctx.lineTo(-3, -2); // 主翼(上)
+    ctx.lineTo(-9, -2); ctx.lineTo(-11, -6); ctx.lineTo(-13, -6); ctx.lineTo(-11, 0); // 尾翼(上)
+    ctx.lineTo(-13, 6); ctx.lineTo(-11, 6); ctx.lineTo(-9, 2); // 尾翼(下)
+    ctx.lineTo(-3, 2); ctx.lineTo(-7, 11); ctx.lineTo(-4, 11); ctx.lineTo(2, 2); // 主翼(下)
+    ctx.lineTo(8, 2);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+    ctx.save();
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
+    ctx.font = 'bold 18px sans-serif'; ctx.fillStyle = '#FDE68A';
+    const valueText = `${departed}便`;
+    const valueRight = rightX - planeW - 6;
+    ctx.fillText(valueText, valueRight, rowY);
+    const valueW = ctx.measureText(valueText).width;
+    ctx.font = 'bold 15px sans-serif'; ctx.fillStyle = '#94A3B8';
+    ctx.fillText('総出発便数', valueRight - valueW - 8, rowY);
+    // 「Good Flight」ポップ（便数が増えるたびに飛行機アイコンの上へ浮かびながら消える）
+    if (departAnim && departAnim.popStartMs !== null) {
+      const p = (departAnim.now - departAnim.popStartMs) / GOOD_FLIGHT_POP_MS;
+      if (p >= 0 && p < 1) {
+        ctx.font = 'bold 28px sans-serif';
+        const popText = 'Good Flight';
+        const popW = ctx.measureText(popText).width;
+        const popCx = Math.min(planeCx, rightX - popW / 2); // キャンバス右端からはみ出さない
+        ctx.globalAlpha = 1 - p;
+        ctx.textAlign = 'center';
+        ctx.lineJoin = 'round'; ctx.lineWidth = 3; ctx.strokeStyle = '#111827';
+        const popY = rowY - 28 - 14 * p; // 総出発便数の行（高さ約24px）と重ならない位置から浮かび上がる
+        ctx.strokeText(popText, popCx, popY);
+        ctx.fillStyle = '#FACC15';
+        ctx.fillText(popText, popCx, popY);
+      }
+    }
+    ctx.restore();
+  }
 
 }
 
@@ -2331,6 +2484,8 @@ export default function BaggageSimulation() {
   // 現在の回で使う乱数シード。「固定」時は常にSIM_RNG_SEED、「ランダム」時はリセット(初期化)のたびに引き直す。
   // 通常再生と搭載終了は必ずこの同じ値を使うことで、同じ回の中では常に一致する結果になる。
   const activeSeedRef         = useRef<number>(SIM_RNG_SEED);
+  // けん引車の出発演出の状態（表示専用。描画ループで updateDepartAnim により更新する）
+  const departAnimRef         = useRef<DepartAnimState>({ now: 0, startMs: new Map(), lastDepartedFlights: 0, popStartMs: null });
 
   const [running, setRunning]             = useState(false);
   const [hasStarted, setHasStarted]       = useState(false);
@@ -2654,7 +2809,8 @@ export default function BaggageSimulation() {
           : s;
       const simCtx = simCanvasRef.current?.getContext('2d');
       if (simCtx) {
-        drawSim(simCtx, displayState, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null, nominalLaneCapacityTotal);
+        updateDepartAnim(displayState, destQuantities, departAnimRef.current, performance.now());
+        drawSim(simCtx, displayState, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null, nominalLaneCapacityTotal, departAnimRef.current);
         if (isRecordingRef.current && offscreenCanvasRef.current && simCanvasRef.current) {
           const offCtx = offscreenCanvasRef.current.getContext('2d');
           if (offCtx) {
@@ -3116,13 +3272,13 @@ export default function BaggageSimulation() {
           {/* 便フィルタで選択中の総便数（フィルタ有効時のみ表示）。
               グラフ本体のサイズ・レイアウト計算には影響を与えず、キャンバス右端の枠ギリギリ
               （SCENE_OUTER_MARGIN分の余白のみ）にオーバーレイ表示する。上下位置はグラフ矩形の
-              上端（chartFinal.y）に合わせる。 */}
+              上端（chartFinal.y）から、キャンバスに描く「総出発便数」の行（高さ約28px）の下へずらす。 */}
           {chartDestFilter && chartDestFilter.indices.length > 0 && (
             <div
               className="absolute flex flex-col gap-2"
               style={{
                 right: `${(SCENE_OUTER_MARGIN / SW * 100).toFixed(1)}%`,
-                top: `${(sceneLayout.chartFinal.y / SH * 100).toFixed(1)}%`,
+                top: `${((sceneLayout.chartFinal.y + 32) / SH * 100).toFixed(1)}%`,
                 zIndex: 5,
               }}
             >
