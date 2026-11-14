@@ -3181,8 +3181,8 @@ export default function BaggageSimulation() {
     <div className="flex flex-col gap-3 p-4 bg-gray-950 min-h-screen text-gray-100">
       <div className="flex items-center justify-between">
         <div className="flex items-baseline gap-2">
-          <h1 className="text-lg font-bold text-gray-100">
-            空港手荷物処理能力シミュレーション
+          <h1 className="text-lg font-bold text-gray-100 leading-tight">
+            空港手荷物処理能力<br />シミュレーション
           </h1>
           {BUILD_VERSION_LABEL && (
             <span
