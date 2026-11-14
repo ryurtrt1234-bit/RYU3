@@ -3184,15 +3184,17 @@ export default function BaggageSimulation() {
           <h1 className="text-lg font-bold text-gray-100 leading-tight">
             空港手荷物処理能力<br />シミュレーション
           </h1>
-          {BUILD_VERSION_LABEL && (
-            <span
-              className="text-[11px] font-light text-gray-500"
-              title="最終pushの日時（JST）"
-            >
-              {BUILD_VERSION_LABEL}
-            </span>
-          )}
         </div>
+        {/* 右上: バージョン表記（最終pushの日時）を右寄せで置き、その下にボタン列を並べる */}
+        <div className="flex flex-col items-end gap-1">
+            {BUILD_VERSION_LABEL && (
+              <span
+                className="text-[11px] font-light text-gray-500"
+                title="最終pushの日時（JST）"
+              >
+                {BUILD_VERSION_LABEL}
+              </span>
+            )}
         <div className="flex gap-2 items-center">
           {process.env.NODE_ENV === 'development' && (
             <div className="flex items-center gap-2">
@@ -3268,6 +3270,7 @@ export default function BaggageSimulation() {
           >
             🎬 通し録画（スタート〜搭載終了）
           </button>
+        </div>
         </div>
       </div>
 
