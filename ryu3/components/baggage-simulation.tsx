@@ -520,7 +520,7 @@ interface WorkerDef {
   emergencyCollectTimer: number;
   travelTimer: number;
   // 「エクセル読み込み」ルール用: 担当便の荷物が初めて投入されるまで非表示、
-  // 担当便の荷物が全て投入されたら再び非表示にする。それ以外のルールでは常にtrue。
+  // 投入が始まった担当便の積み込みがすべて完了したら再び非表示にする。それ以外のルールでは常にtrue。
   visible: boolean;
 }
 
@@ -585,6 +585,8 @@ interface SimState {
   pickByLap: [number, number, number, number];
   // 作業者の辺への割り当て・並べ方の情報（エクセル読み込み時に表示中の作業者だけで並べ直すのに使う）
   workerLayout: WorkerEdgeLayout | null;
+  // 「エクセル読み込み」ルール用: 作業者を非表示から始め、担当便の積み込みが終わったら再び非表示にするモードか
+  hideWorkersWhenIdle: boolean;
 }
 
 // 荷物をベルトから取ったときに周回別ピック数を加算する
@@ -726,6 +728,7 @@ function makeState(
     destColor: new Array(NUM_DESTS).fill(null),
     pickByLap: [0, 0, 0, 0],
     workerLayout,
+    hideWorkersWhenIdle: startHidden,
   };
 }
 
@@ -815,15 +818,14 @@ function placeBagOnBelt(s: SimState, dest: number, spawnPos: number, outerLaneCa
   return true;
 }
 
-// 「エクセル読み込み」ルール用: 担当便の荷物が投入されるたびに呼び、
-// 最初の1個で作業者を表示し、その便の投入数が上限に達したら再び非表示にする。
-function markFlightBagFlow(s: SimState, dest: number, destLimits: number[]) {
+// 「エクセル読み込み」ルール用: 担当便の荷物が投入されるたびに呼び、最初の1個で作業者を表示する。
+// （非表示に戻すのは投入完了時ではなく、積み込み完了時＝markDestFinished で行う）
+function markFlightBagFlow(s: SimState, dest: number) {
   const count = s.spawnedByDest[dest];
   const worker = s.workers.find(w => w.assignedDests.includes(dest));
   if (!worker) return;
   const wasVisible = worker.visible;
   if (count === 1) worker.visible = true;
-  if (destLimits[dest] > 0 && count >= destLimits[dest]) worker.visible = false;
   // 表示/非表示が切り替わったら、その作業者の担当辺を表示中の作業者だけで均等に並べ直す
   if (worker.visible !== wasVisible) relayoutVisibleWorkersOnEdge(s, worker.id);
 }
@@ -839,6 +841,19 @@ function markDestFinished(s: SimState, dest: number, destLimits: number[]) {
   s.destFinishedCount[dest]++;
   if (s.destCompletionTime[dest] === null && destLimits[dest] > 0 && s.destFinishedCount[dest] >= destLimits[dest]) {
     s.destCompletionTime[dest] = s.time;
+    // 「エクセル読み込み」ルール: その作業者の担当便が「積み込み完了」か「まだ投入が始まっていない」だけになったら
+    // 作業者を非表示にする（次の担当便の投入が始まれば markFlightBagFlow で再表示）
+    if (s.hideWorkersWhenIdle) {
+      const worker = s.workers.find(w => w.assignedDests.includes(dest));
+      if (worker && worker.visible) {
+        const idle = worker.assignedDests.every(d =>
+          !(destLimits[d] > 0) || s.destCompletionTime[d] !== null || s.spawnedByDest[d] === 0);
+        if (idle) {
+          worker.visible = false;
+          relayoutVisibleWorkersOnEdge(s, worker.id);
+        }
+      }
+    }
   }
 }
 
@@ -988,7 +1003,7 @@ function stepOnce(
           s.spawnedByDest[dest]++;
           recordDestSpawn(s, dest);
           markDestFinished(s, dest, destLimits);
-          markFlightBagFlow(s, dest, destLimits);
+          markFlightBagFlow(s, dest);
           s.flightEventIdx++;
           continue;
         }
@@ -1001,7 +1016,7 @@ function stepOnce(
         }
         s.spawnedByDest[dest]++;
         recordDestSpawn(s, dest);
-        markFlightBagFlow(s, dest, destLimits);
+        markFlightBagFlow(s, dest);
         s.flightEventIdx++;
       }
     } else {
@@ -2363,17 +2378,32 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     const text = 'ピッピッ';
     const tw = ctx.measureText(text).width;
     const bw = tw + 20, bh = 36;
-    const bx0 = b.x - bw / 2, by0 = b.y - 22 - bh; // 吹き出しの下端（しっぽの付け根）をけん引車中心の22px上に
+    const TAIL = 12, GAP = 22; // しっぽの長さ・けん引車中心から吹き出し本体までの距離
+    // キャンバス枠（SCENE_OUTER_MARGIN の内側）をシーン座標に直した範囲に収める
+    const minX = (SCENE_OUTER_MARGIN - layout.tx) / layout.scale;
+    const maxX = (SW - SCENE_OUTER_MARGIN - layout.tx) / layout.scale;
+    const minY = (SCENE_OUTER_MARGIN - layout.ty) / layout.scale;
+    const maxY = (SH - SCENE_OUTER_MARGIN - layout.ty) / layout.scale;
+    // 基本はけん引車の上側。上端からはみ出すときは下側に出す（しっぽは上向き）
+    const below = b.y - GAP - bh < minY;
+    let by0 = below ? b.y + GAP : b.y - GAP - bh;
+    by0 = Math.max(minY, Math.min(maxY - bh, by0));
+    // 左右は枠からはみ出さないよう内側へ寄せる（しっぽはけん引車の真上／真下のまま）
+    const bx0 = Math.max(minX, Math.min(maxX - bw, b.x - bw / 2));
+    const tailX = Math.max(bx0 + 14, Math.min(bx0 + bw - 14, b.x));
     ctx.fillStyle = '#FFFFFF'; ctx.strokeStyle = '#1F2937'; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.roundRect(bx0, by0, bw, bh, 12); ctx.fill(); ctx.stroke();
     // しっぽ（けん引車に向けた三角）
+    const baseY = below ? by0 : by0 + bh;
+    const tipY = below ? by0 - TAIL : by0 + bh + TAIL;
+    const inset = below ? 0.75 : -0.75;
     ctx.beginPath();
-    ctx.moveTo(b.x - 8, by0 + bh - 0.75); ctx.lineTo(b.x, by0 + bh + 12); ctx.lineTo(b.x + 8, by0 + bh - 0.75);
+    ctx.moveTo(tailX - 8, baseY + inset); ctx.lineTo(tailX, tipY); ctx.lineTo(tailX + 8, baseY + inset);
     ctx.closePath(); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(b.x - 8, by0 + bh); ctx.lineTo(b.x, by0 + bh + 12); ctx.lineTo(b.x + 8, by0 + bh); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(tailX - 8, baseY); ctx.lineTo(tailX, tipY); ctx.lineTo(tailX + 8, baseY); ctx.stroke();
     ctx.fillStyle = '#DC2626';
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(text, b.x, by0 + bh / 2 + 0.5);
+    ctx.fillText(text, bx0 + bw / 2, by0 + bh / 2 + 0.5);
     ctx.restore();
   }
 
