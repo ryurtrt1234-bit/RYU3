@@ -3213,18 +3213,23 @@ export default function BaggageSimulation() {
                   : deployPhase === 'error' ? '❌ 失敗（再試行）'
                   : '🚀 pushして本番反映'}
               </button>
+            </div>
+          )}
+          {/* URLコピーボタンは pushボタンの右隣（pushボタンのない本番画面ではボタン列の先頭） */}
+          <button
+            onClick={copyPublicUrl}
+            className={`px-4 py-1.5 rounded text-sm font-medium ${urlCopied ? 'bg-emerald-600' : 'bg-gray-700 hover:bg-gray-600'}`}
+            title={PUBLIC_SIMULATION_URL}
+          >
+            {urlCopied ? '✓ コピーしました' : '🔗 URLをコピー'}
+          </button>
+          {process.env.NODE_ENV === 'development' && (deployPhase === 'error' || deployPhase === 'done') && (
+            <div className="flex items-center gap-2">
               {deployPhase === 'error' && deployMessage && (
                 <span className="text-xs text-red-400 max-w-xs truncate" title={deployMessage}>{deployMessage}</span>
               )}
               {deployPhase === 'done' && (
-                <a
-                  href={PUBLIC_SIMULATION_URL}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-xs text-emerald-400 underline"
-                >
-                  {PUBLIC_SIMULATION_URL} を開く（本番反映まで数分かかります）
-                </a>
+                <span className="text-xs text-emerald-400">本番まで数分かかります</span>
               )}
             </div>
           )}
@@ -3235,13 +3240,6 @@ export default function BaggageSimulation() {
             className={`px-4 py-1.5 rounded text-sm font-medium ${hasPeakCapture ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-800 text-gray-600 cursor-not-allowed'}`}
           >
             📷 ピーク時キャプチャ
-          </button>
-          <button
-            onClick={copyPublicUrl}
-            className={`px-4 py-1.5 rounded text-sm font-medium ${urlCopied ? 'bg-emerald-600' : 'bg-gray-700 hover:bg-gray-600'}`}
-            title={PUBLIC_SIMULATION_URL}
-          >
-            {urlCopied ? '✓ コピーしました' : '🔗 URLをコピー'}
           </button>
           <button
             onClick={toggleRunning}
