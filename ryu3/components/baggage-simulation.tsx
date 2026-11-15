@@ -125,6 +125,20 @@ function countDepartedFlights(s: SimState, destQuantities: number[], anim: Depar
   }
   return n;
 }
+// 作業者ごとの搭載時間（担当便＝予定投入数1以上の便の荷物が最初に投入されてから、担当便がすべて搭載完了するまで）。
+// 投入前は null。搭載中は現在までの経過秒数（loading=true）、完了後は完了時刻までの秒数を返す（表示専用）
+function workerLoadDuration(s: SimState, w: WorkerDef, destQuantities: number[]): { sec: number; loading: boolean } | null {
+  const ds = w.assignedDests.filter(d => (destQuantities[d] ?? DEFAULT_DEST_QTY) > 0);
+  let start: number | null = null;
+  for (const d of ds) {
+    const t = s.destFirstSpawnTime[d];
+    if (t !== null && t !== undefined && (start === null || t < start)) start = t;
+  }
+  if (start === null) return null;
+  if (!isWorkerLoadComplete(s, w, destQuantities)) return { sec: Math.max(0, s.time - start), loading: true };
+  const end = Math.max(...ds.map(d => s.destCompletionTime[d] as number));
+  return { sec: Math.max(0, end - start), loading: false };
+}
 // 表示する状態に合わせて出発演出の開始時刻を更新する。完了した作業者は初めて見えた時刻から演出を始め、
 // 巻き戻し・リセットで完了前に戻った作業者は演出を取り消す。
 // タイムラインのバー操作・「搭載終了」の一括計算・リセットなどで表示する状態が別の時点へ飛んだときは、
@@ -2421,7 +2435,7 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
   // シーン変換（ベルト＋作業者＋グラフの一括縮小）をここで終了。以降は実キャンバス座標系で固定表示。
   ctx.restore();
 
-  // 総出発便数（グラフ枠の外の右上。グラフ上端の高さに右寄せで「総出発便数 ○/総受託便数便 ✈」）と「Good Flight」ポップ
+  // 総出発便数（グラフ枠の外の右上。グラフ上端の高さに右寄せで「○/総受託便数便 ✈」。ラベル文字は表示しない）と「Good Flight」ポップ
   {
     const departed = countDepartedFlights(s, destQuantities, departAnim);
     // 総受託便数: 全作業者の担当便のうち予定投入数が1以上の便の数（出発便数と同じ数え方）
@@ -2449,10 +2463,7 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     ctx.font = 'bold 18px sans-serif'; ctx.fillStyle = '#FDE68A';
     const valueText = `${departed}/${totalFlights}便`;
     const valueRight = rightX - planeW - 6;
-    ctx.fillText(valueText, valueRight, rowY);
-    const valueW = ctx.measureText(valueText).width;
-    ctx.font = 'bold 15px sans-serif'; ctx.fillStyle = '#FDE68A'; // ラベルも便数と同じ黄色
-    ctx.fillText('総出発便数', valueRight - valueW - 8, rowY);
+    ctx.fillText(valueText, valueRight, rowY); // ラベル文字（「総出発便数」）は表示しない
     // 「Good Flight」ポップ（便数が増えるたびに飛行機アイコンの上へ浮かびながら消える）
     if (departAnim && departAnim.popStartMs !== null) {
       const p = (departAnim.now - departAnim.popStartMs) / GOOD_FLIGHT_POP_MS;
@@ -2470,6 +2481,28 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
         ctx.fillText(popText, popCx, popY);
       }
     }
+    ctx.restore();
+
+    // 総取扱い荷物数（総出発便数の行のすぐ下に同じ並びで「○/△個 [荷物アイコン]」。ラベル文字は表示しない）。
+    // ○は搭載完了した荷物の合計（統計の「処理済」と同じ totalDone）、△は全作業者の担当便の予定投入数の合計
+    const totalBags = s.workers.reduce((sum, w) =>
+      sum + w.assignedDests.reduce((a, d) => a + Math.max(0, destQuantities[d] ?? DEFAULT_DEST_QTY), 0), 0);
+    const bagRowY = rowY + 28;
+    ctx.save();
+    // 荷物アイコン（スーツケース形。図形で描く。飛行機アイコンと同じ幅・同じ青）
+    ctx.translate(planeCx, bagRowY);
+    ctx.fillStyle = '#60A5FA'; ctx.strokeStyle = '#60A5FA';
+    ctx.beginPath(); ctx.roundRect(-11, -6, 22, 15, 3); ctx.fill(); // 本体
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.roundRect(-5, -11, 10, 6, 2); ctx.stroke(); // 取っ手
+    ctx.fillStyle = '#111827';
+    ctx.fillRect(-6, -6, 2, 15); ctx.fillRect(4, -6, 2, 15); // ベルト
+    ctx.restore();
+    ctx.save();
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
+    ctx.font = 'bold 18px sans-serif'; ctx.fillStyle = '#FDE68A';
+    const bagValueText = `${s.totalDone}/${totalBags}個`;
+    ctx.fillText(bagValueText, valueRight, bagRowY); // ラベル文字（「総取扱い荷物数」）は表示しない
     ctx.restore();
   }
 
@@ -2710,6 +2743,7 @@ export default function BaggageSimulation() {
   const [snapshotCount, setSnapshotCount]   = useState(0);
   const [stats, setStats] = useState<{
     id: number; q: number; floor: number; done: number; floorDone: number; workloadPt: number;
+    loadDuration: { sec: number; loading: boolean } | null;
   }[]>([]);
   const [overlayStats, setOverlayStats] = useState<{ time: number; spawned: number; belt: number; done: number; floor: number; totalFloor: number; overflow: number; firstOuterExceedTime: number | null; firstOverflowTime: number | null; emergencyStopCount: number; emergencyStopTotalTime: number; flightsOnBelt: number; totalFlights: number }>({ time: 0, spawned: 0, belt: 0, done: 0, floor: 0, totalFloor: 0, overflow: 0, firstOuterExceedTime: null, firstOverflowTime: null, emergencyStopCount: 0, emergencyStopTotalTime: 0, flightsOnBelt: 0, totalFlights: 0 });
   const [isEmergencyStop, setIsEmergencyStop] = useState(false);
@@ -2872,6 +2906,7 @@ export default function BaggageSimulation() {
           done: w.doneCount,
           floorDone: w.floorDoneCount,
           workloadPt: w.workloadPt,
+          loadDuration: workerLoadDuration(displayState, w, destQuantitiesRef.current),
         })));
       }
       setOverlayStats({
@@ -2999,6 +3034,7 @@ export default function BaggageSimulation() {
       done: w.doneCount,
       floorDone: w.floorDoneCount,
       workloadPt: w.workloadPt,
+      loadDuration: workerLoadDuration(snap, w, destQuantitiesRef.current),
     })));
     setOverlayStats({
       time: snap.time,
@@ -3327,13 +3363,13 @@ export default function BaggageSimulation() {
           {/* 便フィルタで選択中の総便数（フィルタ有効時のみ表示）。
               グラフ本体のサイズ・レイアウト計算には影響を与えず、キャンバス右端の枠ギリギリ
               （SCENE_OUTER_MARGIN分の余白のみ）にオーバーレイ表示する。上下位置はグラフ矩形の
-              上端（chartFinal.y）から、キャンバスに描く「総出発便数」の行（高さ約28px）の下へずらす。 */}
+              上端（chartFinal.y）から、キャンバスに描く「総出発便数」「総取扱い荷物数」の2行（各高さ約28px）の下へずらす。 */}
           {chartDestFilter && chartDestFilter.indices.length > 0 && (
             <div
               className="absolute flex flex-col gap-2"
               style={{
                 right: `${(SCENE_OUTER_MARGIN / SW * 100).toFixed(1)}%`,
-                top: `${((sceneLayout.chartFinal.y + 32) / SH * 100).toFixed(1)}%`,
+                top: `${((sceneLayout.chartFinal.y + 60) / SH * 100).toFixed(1)}%`,
                 zIndex: 5,
               }}
             >
@@ -3752,6 +3788,10 @@ export default function BaggageSimulation() {
                 </div>
                 <div className="text-xs text-gray-300 ml-2 mt-1">
                   床搭載率 {floorRatePct}% / 直搭載率 {directRatePct}%
+                </div>
+                {/* 搭載時間: 担当便の荷物が最初に投入されてから、担当便の最後の荷物を搭載完了するまで */}
+                <div className="text-xs text-sky-300 ml-2 mt-1">
+                  搭載時間 {st?.loadDuration ? `${fmtSimTime(st.loadDuration.sec)}${st.loadDuration.loading ? '（搭載中）' : ''}` : '—'}
                 </div>
               </div>
             );
