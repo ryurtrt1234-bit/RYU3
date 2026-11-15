@@ -1181,6 +1181,8 @@ function stepOnce(
       if (nextRandom(s) >= effectivePickupRate) continue;
 
       const forceFloor = beltBagCount >= beltFloorTrigger;
+      // 床仮置き積極化中に床の荷物が床仮置き上限に達している作業者は、ベルトからは取らず床から積み込む（直搭載には戻らない）
+      if (forceFloor && w.floorQueue.length + (w.activeFloor ? 1 : 0) >= floorMax) continue;
       recordPickByLap(s, bag);
       if (w.floorQueue.length + (w.activeFloor ? 1 : 0) < floorMax && (forceFloor || nextRandom(s) < floorDropProb)) {
         bag.state = 'floor'; bag.workerId = w.id;
@@ -1198,6 +1200,11 @@ function stepOnce(
 
   const beltCountNow = s.bags.filter(b => b.state === 'belt').length;
   const beltSparse = beltCountNow <= (outerLaneCapacity + innerLaneCapacity) / 2;
+
+  // 床仮置き積極化中（ベルト上が床仮置き積極化 ベルト数閾値以上）は、床に置くだけに専念し床からの積み込みを新しく始めない
+  // （直搭載の待ち行列と、積み込み中の1個はそのまま続ける）。閾値未満になったら床からの積み込みを再開する。
+  // 緊急停止中は解除に床の荷物の積み込み完了が必要なため例外とし、ベルト上の数に関係なく床から積み込む
+  const floorAggressive = !s.emergencyStop && s.bags.filter(b => b.state === 'belt').length >= beltFloorTrigger;
 
   for (const w of s.workers) {
     // 排他処理: 通常処理中は床仮置き処理不可、床仮置き処理中は通常処理不可
@@ -1240,6 +1247,20 @@ function stepOnce(
     } else if (w.travelTimer > 0) {
       // 移動/荷物探し待機中
       w.travelTimer = Math.max(0, w.travelTimer - dt);
+    } else if (floorAggressive) {
+      // 床仮置き積極化中: 直搭載の待ち行列があれば先に処理する。床の荷物が床仮置き上限に達している作業者は床から1個積み込み、
+      // 上限未満の作業者は床からの積み込みを始めず（一括処理も中断）床に置くことに専念する
+      w.floorBatchActive = false;
+      if (w.queue.length > 0) {
+        w.current = w.queue.shift()!;
+        w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride) + floorExtraTime; // 直搭載＝②（または個別処理速度）＋⑤搭載調整時間
+        w.activeProcPt = w.procTimer;
+        w.findTimer = findTime; // ①見つける（積み込み前の待ち）
+      } else if (w.floorQueue.length >= floorMax) {
+        w.activeFloor = w.floorQueue.shift()!;
+        w.activeFloor.timer = w.activeFloor.maxTimer;
+        w.findTimer = findTime; // ①見つける（積み込み前の待ち）
+      }
     } else {
       // 優先順位: バッチ継続 > [スパース時]床置き優先 > ベルトキュー > [アイドル時]床置き
       if (w.floorBatchActive) {
@@ -2835,9 +2856,6 @@ export default function BaggageSimulation() {
     () => workerNet.map(net => Math.max(MIN_DIRECT_PROC_SEC, net)),
     [workerNet],
   );
-  // 「一括処理時間調整」バー専用の表示値（＝合計作業時間〔②＋③＋④〕の一括設定値）。
-  // 作業1バーを個別に動かした時にも一括バーが連動して見えてしまわないよう、独立させている。
-  const [batchSpeedAdjust, setBatchSpeedAdjust] = useState(DEFAULT_NET_TIME + DEFAULT_AUX_TIME + DEFAULT_SEAL_TIME);
   const [floorDropProb, setFloorDropProb]         = useState(0.3);
   const [pickupRate, setPickupRate]               = useState(0.5);
   const [pickupForceThreshold, setPickupForceThreshold] = useState(50);
@@ -3407,14 +3425,6 @@ export default function BaggageSimulation() {
     if (kind === 'net') { setWorkerNet(new Array(MAX_WORKERS).fill(v)); setCommonNet(v); }
     else if (kind === 'aux') { setWorkerAux(new Array(MAX_WORKERS).fill(v)); setCommonAux(v); }
     else { setWorkerSeal(new Array(MAX_WORKERS).fill(v)); setCommonSeal(v); }
-  };
-  // 一括処理時間調整: 全員の合計作業時間（②＋③＋④）がこの値になるよう、②正味搭載だけを調整する
-  // （②が0〜10秒に収まらない場合は範囲の端で止めるため、合計がこの値にならないことがある）
-  const clampWorkElem = (v: number) => Math.min(WORK_ELEM_MAX, Math.max(WORK_ELEM_MIN, v));
-  const updateAllWorkerSpeeds = (v: number) => {
-    setWorkerNet(prev => prev.map((_, i) => clampWorkElem(v - (workerAux[i] ?? DEFAULT_AUX_TIME) - (workerSeal[i] ?? DEFAULT_SEAL_TIME))));
-    setCommonNet(clampWorkElem(v - commonAux - commonSeal));
-    setBatchSpeedAdjust(v);
   };
   const toggleDest = (wi: number, di: number) => {
     setWorkerDests(prev => {
@@ -4075,14 +4085,6 @@ export default function BaggageSimulation() {
               onChange={setWorkerCount}
             />
           </div>
-          <div className="pb-2 border-b border-gray-700">
-            <Slider
-              label={`一括処理時間調整（合計作業時間＝②＋③＋④）: ${batchSpeedAdjust} 秒/個`}
-              min={5} max={15} step={1}
-              value={batchSpeedAdjust}
-              onChange={updateAllWorkerSpeeds}
-            />
-          </div>
           {/* 作業時間（全員共通）: 動かすと全員のその要素を同じ値にする（①見つけるは全体設定） */}
           <div className="pb-2 border-b border-gray-700">
             <div className="text-xs text-gray-400 mb-1">作業時間（全員共通）</div>
@@ -4217,7 +4219,8 @@ export default function BaggageSimulation() {
             <div className="mt-3 pt-2 border-t border-gray-700 text-xs text-gray-500 space-y-1">
               <div>・カロリーPTに入るのは「積み込み時間」だけ（<CircledNum c="①" />・<CircledNum c="⑥" />は入らない）</div>
               <div>・便フィルタの個別処理速度を設定した便は、<CircledNum c="②" />をその秒数に置き換える</div>
-              <div>・床仮置き積極化時は、取った荷物を100%床に置く（床置き確率は使わない）。ただし床の荷物が床仮置き上限（{floorMax}個）に達している作業者は直搭載になる</div>
+              <div>・床仮置き積極化時は、取った荷物を100%床に置く（床置き確率は使わない）</div>
+              <div>・積極化中は取った荷物を即時に床へ置くことに専念し、床の荷物が床仮置き上限（{floorMax}個）に達した作業者はベルトから取らずに床から積み込む（上限未満の間は床から積まない。閾値未満・緊急停止中は通常どおり床から積み込む）</div>
               <div>・<CircledNum c="②" /><CircledNum c="③" /><CircledNum c="④" />は作業者ごとに個別設定できる（この表は「作業時間（全員共通）」の値で計算）</div>
             </div>
           </div>
@@ -4257,6 +4260,7 @@ export default function BaggageSimulation() {
             <div className="mt-3 pt-2 border-t border-gray-700 text-xs text-gray-500 space-y-1">
               <div>・床の荷物を積み込むタイミング: 直搭載の待ちがないとき／ベルト上が上限の半分（{unlimitedLaneCapacity ? '無制限' : `${(outerLaneCapacity + innerLaneCapacity) / 2}個`}）以下で床の荷物が床仮置き一括処理閾値（{floorBatchThreshold}個）以上のとき（まとめて処理）／全部の荷物を投入し終えてベルトが空のとき</div>
               <div>・緊急停止で回収した荷物は、床置き確率と床仮置き上限に関係なく床に置く</div>
+              <div>・床仮置き積極化中（ベルト上{beltFloorTrigger}個以上）は、取った荷物を即時に床へ置くことに専念し、床の荷物が床仮置き上限（{floorMax}個）に達した作業者はベルトから取らずに床から積み込む（緊急停止中は通常どおり床から積み込む）</div>
             </div>
           </div>
           </div>
