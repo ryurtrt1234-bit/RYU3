@@ -1173,7 +1173,9 @@ function stepOnce(
       const isAssigned = w.assignedDests.includes(bag.destination);
       if (!isAssigned) continue;
 
-      if (w.current !== null || w.queue.length > 0) continue;
+      // 作業者が何もしていないときだけ取る: 直搭載の積み込み中・待ち行列あり・床からの積み込み中・
+      // ①見つけるの待ち中・⑥搭載後の移動/荷物探しの待ち中は取らない（荷物はそのまま流れていく）
+      if (w.current !== null || w.queue.length > 0 || w.activeFloor !== null || (w.findTimer ?? 0) > 0 || (w.travelTimer ?? 0) > 0) continue;
 
       const effectivePickupRate = beltBagCount <= pickupForceThreshold ? 1.0 : pickupRate;
       if (nextRandom(s) >= effectivePickupRate) continue;
@@ -4226,7 +4228,7 @@ export default function BaggageSimulation() {
             <div className="text-xs text-gray-300 mb-1">判定の流れ</div>
             <ol className="list-decimal ml-5 text-xs text-gray-400 space-y-0.5 mb-3">
               <li>担当便の荷物でなければ取らない</li>
-              <li>作業者が積み込み中か、待ち行列があれば取らない（荷物は流れていく）</li>
+              <li>作業者が作業中（<CircledNum c="①" />の待ち・積み込み・<CircledNum c="⑥" />の待ち）か、待ち行列があれば取らない（荷物は流れていく）</li>
               <li>ベルト上が100％ピックアップ荷物数（{pickupForceThreshold}個）以下なら必ず取る。それより多ければピックアップ率（{Math.round(pickupRate * 100)}%）で取る</li>
               <li>取った荷物を床に置くか直搭載にするかを下の表で決める</li>
             </ol>
