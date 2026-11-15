@@ -2283,9 +2283,9 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
       const markColor = LAP_MARK_LIGHT_ON_BAG_COLORS.has(bag.color.toUpperCase()) ? '#FFFFFF' : '#000000';
       const hw = s.bagW / 2 - 0.8, hh = s.bagH / 2 - 0.8; // 荷物の枠線(0.8)の内側
       if (bag.circuits >= 3) {
-        // 塗りつぶしなし（線のみ。太さは×と同じ1.8）の五芒星（荷物の短い方の半辺の1.5倍の大きさ。荷物からはみ出してもよい）
+        // 塗りつぶしなし（線のみ。太さは×と同じ1.0）の五芒星（荷物の短い方の半辺の1.5倍の大きさ。荷物からはみ出してもよい）
         const ro = Math.min(hw, hh) * 1.5, ri = ro * 0.45;
-        ctx.strokeStyle = markColor; ctx.lineWidth = 1.8; ctx.lineJoin = 'round';
+        ctx.strokeStyle = markColor; ctx.lineWidth = 1.0; ctx.lineJoin = 'round';
         ctx.beginPath();
         for (let k = 0; k < 10; k++) {
           const r = k % 2 === 0 ? ro : ri;
@@ -2294,7 +2294,7 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
         }
         ctx.closePath(); ctx.stroke();
       } else if (bag.circuits === 2) {
-        const lw = 1.8;
+        const lw = 1.0;
         const ix = hw - lw / 2, iy = hh - lw / 2;
         ctx.strokeStyle = markColor; ctx.lineWidth = lw;
         ctx.beginPath();
@@ -2302,8 +2302,8 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
         ctx.moveTo(ix, -iy); ctx.lineTo(-ix, iy);
         ctx.stroke();
       } else {
-        // 塗りつぶしなし（線のみ。太さは×・☆と同じ1.8）。線が荷物からはみ出さないよう線幅の半分だけ内側に縮める
-        const lw = 1.8;
+        // 塗りつぶしなし（線のみ。太さは×・☆と同じ1.0）。線が荷物からはみ出さないよう線幅の半分だけ内側に縮める
+        const lw = 1.0;
         const ix = hw - lw / 2, iy = hh - lw / 2;
         ctx.strokeStyle = markColor; ctx.lineWidth = lw; ctx.lineJoin = 'round';
         ctx.beginPath();
