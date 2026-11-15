@@ -1843,7 +1843,9 @@ function drawStatsPanel(ctx: CanvasRenderingContext2D, s: SimState, simSpeed: nu
 }
 
 // ── Draw simulation canvas ───────────────────────────────────
-function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean, chartSeriesVisible: ChartSeriesVisible, chartDestFilter: ChartDestFilter | null = null, speedOverrideSeconds: number | null = null, nominalLaneCapacityTotal: number | null = null, departAnim: DepartAnimState | null = null, plannedMaxWorkers: number | null = null, prevChart: PrevChartData | null = null) {
+function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean, chartSeriesVisible: ChartSeriesVisible, chartDestFilter: ChartDestFilter | null = null, speedOverrideSeconds: number | null = null, nominalLaneCapacityTotal: number | null = null, departAnim: DepartAnimState | null = null, plannedMaxWorkers: number | null = null, prevChart: PrevChartData | null = null, beltFloorTrigger: number = Infinity, bendHold: BendHoldMap | null = null) {
+  // 作業者アイコンのポーズ判定用: 描画時点のベルト上の荷物数（床仮置き積極化 ベルト数閾値と比べる）
+  const beltCountForPose = s.bags.filter(b => b.state === 'belt').length;
   // plannedMaxWorkers: 裏で最初から最後まで一括計算して求めた最大同時作業人数（「アサイン ○名」に最初から表示する計画値。計算前は null）
   const { workers, bags, beltW: BW, beltH: BH, beltR: BR, beltWidthPx } = s;
 
@@ -2254,16 +2256,42 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     // Worker icon（全身の人型。旧・丸型アイコン（直径40px）とほぼ同じ範囲に収める: 高さ約40px・幅約30px、常に立ち姿）
     // 人型アイコンの色は白（待ち件数バッジは緑の col のまま）
     const iconCol = '#FFFFFF';
-    // ポーズ: 'lift' = 腕を斜め上・外側へ上げ頭上に荷物を持つ（ベルトからの搭載中／床からの搭載の後半50%）、
-    //         'bend' = 腰をかがめて足元の荷物を取る（床からの搭載の前半50%。画面左向きにかがむ）、'stand' = 通常の立ち姿
+    // ポーズ: 'lift' = 腕を斜め上・外側へ上げ頭上に荷物を持つ（ベルトからの搭載中／床からの搭載で③付帯の秒数を過ぎた後）、
+    //         'bend' = 腰をかがめて足元の荷物を取る床置きの絵（床からの搭載では必ずこの絵を挟んでから持ち上げる。
+    //         長さは③付帯の秒数〔③が0秒なら積み込み時間の前半50%〕、最大で積み込み時間の90%。画面左向きにかがむ）、
+    //         'stand' = 通常の立ち姿
     let pose: 'stand' | 'lift' | 'bend' = 'stand';
     let poseBagColor = '';
     if (w.current) {
-      pose = 'lift'; poseBagColor = w.current.color;
+      // 直搭載は持ち上げの絵。ただしベルト上の荷物数が床仮置き積極化 ベルト数閾値以上の間は、
+      // 積み込み時間の前半50%を腰を曲げる絵にしてから持ち上げる（表示のみ。計算は直搭載のまま）
+      const directProgress = w.activeProcPt > 0 ? 1 - w.procTimer / w.activeProcPt : 1;
+      pose = (beltCountForPose >= beltFloorTrigger && directProgress < 0.5) ? 'bend' : 'lift';
+      poseBagColor = w.current.color;
     } else if (w.activeFloor) {
-      const fp = w.activeFloor.maxTimer > 0 ? 1 - w.activeFloor.timer / w.activeFloor.maxTimer : 1;
-      pose = fp < 0.5 ? 'bend' : 'lift';
+      // 床からの積み込みは必ず「床置きの絵（かがむ）→持ち上げ」の順。かがむ長さは③付帯（その作業者の値）の秒数、
+      // ③が0秒なら積み込み時間の前半50%。持ち上げの絵も必ず出るよう、かがむのは最大で積み込み時間の90%まで
+      const maxT = w.activeFloor.maxTimer;
+      const elapsed = maxT - w.activeFloor.timer;
+      const aux = w.auxSec ?? 0;
+      const bendSec = Math.min(aux > 0 ? aux : maxT * 0.5, maxT * 0.9);
+      pose = elapsed < bendSec ? 'bend' : 'lift';
       poseBagColor = w.activeFloor.color;
+    }
+    // 速い再生でも腰を曲げる絵が見えるよう、腰を曲げる絵を挟む荷物（床からの積み込み／閾値以上での直搭載）を
+    // 初めて描くときから実時間で最低 BEND_POSE_HOLD_MS は腰を曲げる絵にする（表示のみ。計算には影響しない）
+    if (bendHold) {
+      const holdBagId = w.activeFloor ? w.activeFloor.id : w.current ? w.current.id : null;
+      const shouldBend = !!w.activeFloor || (!!w.current && beltCountForPose >= beltFloorTrigger);
+      if (holdBagId !== null) {
+        const nowMs = performance.now();
+        let hold = bendHold.get(w.id);
+        if (shouldBend && (!hold || hold.bagId !== holdBagId)) {
+          hold = { bagId: holdBagId, startMs: nowMs };
+          bendHold.set(w.id, hold);
+        }
+        if (hold && hold.bagId === holdBagId && nowMs - hold.startMs < BEND_POSE_HOLD_MS) pose = 'bend';
+      }
     }
     // 人型アイコン＋作業者番号の描画。立ち姿のときはこの場で描き（「済/床」枠より背面）、
     // 動いているとき（搭載中のポーズ）は「済/床」枠の描画後に描いて枠より前面にする
@@ -2735,6 +2763,11 @@ function updateMaxBeltSnapshot(s: SimState, ref: { current: MaxBeltSnapshot }) {
   }
 }
 
+// 作業者アイコンの「腰を曲げる絵」を、再生速度に関係なく画面上で最低限表示する実時間（ミリ秒）。表示専用
+const BEND_POSE_HOLD_MS = 300;
+// 作業者ごとに「腰を曲げる絵を出し始めた荷物とその実時間」を覚えておく（描画側だけの状態。シミュレーションには持たせない）
+type BendHoldMap = Map<number, { bagId: number; startMs: number }>;
+
 // ── Main component ───────────────────────────────────────────
 export default function BaggageSimulation() {
   const simCanvasRef          = useRef<HTMLCanvasElement>(null);
@@ -2763,6 +2796,8 @@ export default function BaggageSimulation() {
   // 通常再生と搭載終了は必ずこの同じ値を使うことで、同じ回の中では常に一致する結果になる。
   const activeSeedRef         = useRef<number>(SIM_RNG_SEED);
   // けん引車の出発演出の状態（表示専用。描画ループで updateDepartAnim により更新する）
+  // 作業者アイコンの「腰を曲げる絵」の最低表示時間用（描画側だけの状態）
+  const bendHoldRef = useRef<BendHoldMap>(new Map());
   const departAnimRef         = useRef<DepartAnimState>({ now: 0, startMs: new Map(), lastDepartedFlights: 0, popStartMs: null, lastState: null, lastTime: 0 });
 
   const [running, setRunning]             = useState(false);
@@ -3057,6 +3092,7 @@ export default function BaggageSimulation() {
       workerSeal.slice(0, workerCount),
     );
     lastTsRef.current = 0;
+    bendHoldRef.current.clear();
     maxBeltSnapshotRef.current = { count: -1, snapshot: null };
     setHasPeakCapture(false);
     setSimInitVersion(v => v + 1);
@@ -3123,7 +3159,7 @@ export default function BaggageSimulation() {
       const simCtx = simCanvasRef.current?.getContext('2d');
       if (simCtx) {
         updateDepartAnim(displayState, destQuantities, departAnimRef.current, performance.now());
-        drawSim(simCtx, displayState, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null, nominalLaneCapacityTotal, departAnimRef.current, plannedMaxWorkersRef.current, showPrevChart ? prevChartRef.current : null);
+        drawSim(simCtx, displayState, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null, nominalLaneCapacityTotal, departAnimRef.current, plannedMaxWorkersRef.current, showPrevChart ? prevChartRef.current : null, beltFloorTrigger, bendHoldRef.current);
         if (isRecordingRef.current && offscreenCanvasRef.current && simCanvasRef.current) {
           const offCtx = offscreenCanvasRef.current.getContext('2d');
           if (offCtx) {
@@ -3499,7 +3535,7 @@ export default function BaggageSimulation() {
     }
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    drawSim(ctx, snap, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null, nominalLaneCapacityTotal, null, plannedMaxWorkersRef.current);
+    drawSim(ctx, snap, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null, nominalLaneCapacityTotal, null, plannedMaxWorkersRef.current, null, beltFloorTrigger);
     const dataUrl = canvas.toDataURL('image/png');
     const a = document.createElement('a');
     a.href = dataUrl;
@@ -3507,7 +3543,7 @@ export default function BaggageSimulation() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-  }, [destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride, nominalLaneCapacityTotal]);
+  }, [destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride, nominalLaneCapacityTotal, beltFloorTrigger]);
 
   const copyPublicUrl = useCallback(async () => {
     try {
@@ -4135,6 +4171,8 @@ export default function BaggageSimulation() {
           { name: '直搭載', load: ['②', '⑤'], loadSec: t2 + t5 },
           { name: '床搭載', load: ['②', '③', '④', '⑤'], loadSec: t2 + t3 + t4 + t5 },
           { name: '緊急停止時の床搭載', load: ['②', '③', '④', '⑤', '⑦'], loadSec: t2 + t3 + t4 + t5 + t7 },
+          // ベルト上が床仮置き積極化 ベルト数閾値以上のときは取った荷物を強制で床に置く（積み込み時間は通常の床搭載と同じ）
+          { name: `床仮置き積極化時の床搭載（ベルト上${beltFloorTrigger}個以上）`, load: ['②', '③', '④', '⑤'], loadSec: t2 + t3 + t4 + t5 },
         ];
         const legend: [string, string, number][] = [
           ['①', '見つける', t1], ['②', '正味直搭載', t2], ['③', '付帯（床置き＋スキャン）', t3], ['④', 'シール', t4],
@@ -4144,7 +4182,8 @@ export default function BaggageSimulation() {
           <span key={k}>{k > 0 && '＋'}<CircledNum c={m} /></span>
         ));
         return (
-          <div className="flex-1 min-w-60 bg-gray-900 rounded-lg p-4 border border-gray-700 self-start">
+          <div className="flex-1 min-w-60 flex flex-col gap-4 self-start">
+          <div className="bg-gray-900 rounded-lg p-4 border border-gray-700">
             <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">荷物の積み込みにかかる時間（ケース別）</div>
             <table className="w-full text-xs text-gray-300 border-collapse">
               <thead>
@@ -4176,8 +4215,48 @@ export default function BaggageSimulation() {
             <div className="mt-3 pt-2 border-t border-gray-700 text-xs text-gray-500 space-y-1">
               <div>・カロリーPTに入るのは「積み込み時間」だけ（<CircledNum c="①" />・<CircledNum c="⑥" />は入らない）</div>
               <div>・便フィルタの個別処理速度を設定した便は、<CircledNum c="②" />をその秒数に置き換える</div>
+              <div>・床仮置き積極化時は、取った荷物を100%床に置く（床置き確率は使わない）。ただし床の荷物が床仮置き上限（{floorMax}個）に達している作業者は直搭載になる</div>
               <div>・<CircledNum c="②" /><CircledNum c="③" /><CircledNum c="④" />は作業者ごとに個別設定できる（この表は「作業時間（全員共通）」の値で計算）</div>
             </div>
+          </div>
+
+          {/* 床置き確率のルール: 作業者が荷物を取ったときに直搭載か床置きかを決める判定（現在の設定値を表示）。表示専用 */}
+          <div className="bg-gray-900 rounded-lg p-4 border border-gray-700">
+            <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">床置き確率のルール（荷物を取ったときに直搭載か床置きかを決める）</div>
+            <div className="text-xs text-gray-300 mb-1">判定の流れ</div>
+            <ol className="list-decimal ml-5 text-xs text-gray-400 space-y-0.5 mb-3">
+              <li>担当便の荷物でなければ取らない</li>
+              <li>作業者が積み込み中か、待ち行列があれば取らない（荷物は流れていく）</li>
+              <li>ベルト上が100％ピックアップ荷物数（{pickupForceThreshold}個）以下なら必ず取る。それより多ければピックアップ率（{Math.round(pickupRate * 100)}%）で取る</li>
+              <li>取った荷物を床に置くか直搭載にするかを下の表で決める</li>
+            </ol>
+            <table className="w-full text-xs text-gray-300 border-collapse">
+              <thead>
+                <tr className="text-gray-400 border-b border-gray-700">
+                  <th className="text-left font-medium py-1 pr-2">状況</th>
+                  <th className="text-right font-medium py-1">床に置く確率</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr className="border-b border-gray-800">
+                  <td className="py-1.5 pr-2">床の荷物が床仮置き上限（{floorMax}個）に達している</td>
+                  <td className="py-1.5 text-right whitespace-nowrap">0%（必ず直搭載）</td>
+                </tr>
+                <tr className="border-b border-gray-800">
+                  <td className="py-1.5 pr-2">ベルト上が床仮置き積極化 ベルト数閾値（{beltFloorTrigger}個）以上</td>
+                  <td className="py-1.5 text-right whitespace-nowrap">100%（強制床置き）</td>
+                </tr>
+                <tr className="border-b border-gray-800">
+                  <td className="py-1.5 pr-2">それ以外</td>
+                  <td className="py-1.5 text-right whitespace-nowrap text-emerald-300">床置き確率（{Math.round(floorDropProb * 100)}%）</td>
+                </tr>
+              </tbody>
+            </table>
+            <div className="mt-3 pt-2 border-t border-gray-700 text-xs text-gray-500 space-y-1">
+              <div>・床の荷物を積み込むタイミング: 直搭載の待ちがないとき／ベルト上が上限の半分（{unlimitedLaneCapacity ? '無制限' : `${(outerLaneCapacity + innerLaneCapacity) / 2}個`}）以下で床の荷物が床仮置き一括処理閾値（{floorBatchThreshold}個）以上のとき（まとめて処理）／全部の荷物を投入し終えてベルトが空のとき</div>
+              <div>・緊急停止で回収した荷物は、床置き確率と床仮置き上限に関係なく床に置く</div>
+            </div>
+          </div>
           </div>
         );
       })()}
