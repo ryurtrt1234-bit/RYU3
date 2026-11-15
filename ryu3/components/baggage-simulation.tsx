@@ -562,6 +562,14 @@ interface HistPt {
   beltByDest: number[];
   spawnedByDest: number[];
   doneByDest: number[];
+  // 作業者がベルトから降ろした荷物の累計（待ち行列に取った数＋床に置いた数＋緊急停止時の床置き回収。
+  // pickByLap の合計と同じ数え方）と、その便ごとの内訳。グラフの「5分ごとの取り出し数」に使う
+  picked?: number;
+  pickedByDest?: number[];
+  // 「5分ごとの処理能力」用: この時点でベルトに配置（表示）されていた作業者の index（未指定＝全作業者）と、
+  // 移動・荷物探しの待機秒数
+  activeWorkerIds?: number[];
+  travel?: number;
 }
 
 interface SimState {
@@ -610,6 +618,8 @@ interface SimState {
   // 作業者がベルトから取った荷物の累計を、取った時点の周回で分けた数 [1周目, 2周目, 3周目, 4周目以上]
   // （circuits=0/1/2/3以上。通常のピック〔待ち行列・床置き〕と緊急停止時の床置き回収を含む）
   pickByLap: [number, number, number, number];
+  // 便（destination）ごとの、ベルトから降ろした荷物の累計（pickByLap と同じ数え方の便別内訳）。グラフの便フィルタ用。表示専用
+  pickedByDest: number[];
   // 作業者の辺への割り当て・並べ方の情報（エクセル読み込み時に表示中の作業者だけで並べ直すのに使う）
   workerLayout: WorkerEdgeLayout | null;
   // 「エクセル読み込み」ルール用: 作業者を非表示から始め、担当便の積み込みが終わったら再び非表示にするモードか
@@ -621,6 +631,9 @@ function recordPickByLap(s: SimState, bag: Bag) {
   // 古いスナップショット由来で要素が3つの場合も4つ目を0から数える
   const i = Math.min(bag.circuits, 3);
   s.pickByLap[i] = (s.pickByLap[i] ?? 0) + 1;
+  // 古いスナップショット由来で pickedByDest が無い場合も0から数える
+  if (!s.pickedByDest) s.pickedByDest = new Array(NUM_DESTS).fill(0);
+  s.pickedByDest[bag.destination] = (s.pickedByDest[bag.destination] ?? 0) + 1;
 }
 
 interface FlightSpawnEvent {
@@ -755,6 +768,7 @@ function makeState(
     doneByDest: new Array(NUM_DESTS).fill(0),
     destColor: new Array(NUM_DESTS).fill(null),
     pickByLap: [0, 0, 0, 0],
+    pickedByDest: new Array(NUM_DESTS).fill(0),
     workerLayout,
     hideWorkersWhenIdle: startHidden,
   };
@@ -1023,6 +1037,14 @@ function stepOnce(
         const dest = s.flightEvents[s.flightEventIdx].dest;
         const totalBeltCount = s.bags.filter(b => b.state === 'belt').length;
 
+        // 1個投入するたびに緊急停止荷物数を確認し、達していたらその場で緊急停止にして残りの投入を止める
+        // （この荷物は予定から消さず、解除後に順番どおり投入する。解除直後のまとめ投入で閾値を超えないようにするため）
+        if (totalBeltCount >= emergencyThreshold) {
+          s.emergencyStop = true;
+          s.emergencyStopCount++;
+          break;
+        }
+
         if (totalBeltCount >= outerLaneCapacity + innerLaneCapacity) {
           // ベルト満杯 → オーバーフローとして扱い、この便の投入完了判定は進める
           if (s.firstOverflowTime === null) s.firstOverflowTime = s.time;
@@ -1053,6 +1075,13 @@ function stepOnce(
       const totalSpawned = s.spawnedByDest.reduce((a, b, i) => assignedSet.has(i) ? a + b : a, 0);
       if (totalSpawned < totalLimit) {
         while (s.time >= s.nextSpawn) {
+          // 1個投入するたびに緊急停止荷物数を確認し、達していたらその場で緊急停止にして投入を止める
+          // （行先便の決定＝乱数の消費より前に判定する。解除時に nextSpawn は現在時刻へリセットされる）
+          if (s.bags.filter(b => b.state === 'belt').length >= emergencyThreshold) {
+            s.emergencyStop = true;
+            s.emergencyStopCount++;
+            break;
+          }
           const available = Array.from({ length: NUM_DESTS }, (_, i) => i)
             .filter(d => assignedSet.has(d) && s.spawnedByDest[d] < destLimits[d]);
           if (available.length > 0) {
@@ -1261,6 +1290,13 @@ function stepOnce(
       beltByDest,
       spawnedByDest: s.spawnedByDest.slice(),
       doneByDest: s.doneByDest.slice(),
+      picked: (s.pickByLap ?? []).reduce((a, b) => a + (b ?? 0), 0),
+      pickedByDest: (s.pickedByDest ?? new Array(NUM_DESTS).fill(0)).slice(),
+      // 全作業者が常に配置されているルールでは省略（記録量を抑えるため）
+      activeWorkerIds: s.hideWorkersWhenIdle
+        ? s.workers.reduce<number[]>((ids, w, wi) => { if (w.visible) ids.push(wi); return ids; }, [])
+        : undefined,
+      travel: workerTravelTime,
     });
   }
 }
@@ -1278,15 +1314,23 @@ function niceCeil(value: number): number {
 // グラフの各系列を表示するかどうか（右サイドパネルのタブで切り替え）
 interface ChartSeriesVisible {
   belt: boolean;
-  spawned: boolean;
-  done: boolean;
-  flights: boolean; // 行先便数（右軸）。投入量・処理済とは右軸を共有できないため排他表示
-  bucketSpawn: boolean; // 5分ごとの投入量（右軸）。累計値とは桁が異なるため投入量（累計）・行先便数とは排他。処理済とは同時表示可
-  // done（処理済）は5分ごとの処理数（右軸・0〜250個固定）。5分ごとの投入量とは同時表示可、投入量（累計）・行先便数とは排他
+  // 5分ごとの処理能力（右軸・点線）: 配置中の作業者が5分で処理できる理論上の上限（300秒÷（処理秒数＋移動待機秒数）の合計）
+  capacity: boolean;
+  // 取り出し数（右軸・累計）: 作業者がベルトから降ろした荷物の累計（待ち行列＋床置き＋緊急時の床置き回収）。
+  // 累計投入数の線と対で表示し、2本のすき間＝ベルト上の荷物数＋オーバーフロー破棄数になる。
+  // 右軸が累計の桁になるため、他の右軸系列（5分ごとの投入量・処理能力・行先便数）とは排他
+  picked: boolean;
+  flights: boolean; // 行先便数（右軸）。他の右軸系列とは右軸を共有できないため排他表示
+  bucketSpawn: boolean; // 5分ごとの投入量（右軸）
+  // 5分ごとの投入量・処理能力は右軸を共有して同時表示可。行先便数・取り出し数とは排他
 }
 
 // 棒グラフで表示する集計区間（秒）。「5分ごとの投入量」の区切り幅。
 const BUCKET_SEC = 300;
+// 「5分ごとの処理能力」表示中の右軸の上限（個・固定）
+const CAPACITY_AXIS_MAX = 1500;
+// 便フィルタ選択中（対象便の担当作業者だけで計算）の「5分ごとの処理能力」の右軸の上限（個・固定）
+const CAPACITY_AXIS_MAX_FILTERED = 750;
 
 // グラフの「便フィルタ」: 指定した便（destination index）のみに絞り込んで系列を再集計する。
 // indicesが空（該当便なし）の場合はグラフ側で「該当する便がありません」を表示する。
@@ -1295,7 +1339,74 @@ interface ChartDestFilter {
   label: string; // 注記表示用（HND・NRT・手入力した文字列など）
 }
 
-function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCapacity: number, outerLaneCapacity: number, visible: ChartSeriesVisible, rect: { x: number; y: number; w: number; h: number }, destFilter: ChartDestFilter | null = null, nominalLaneCapacityTotal: number | null = null) {
+// 「前回結果を重ねる」用: リセット直前の計算結果（グラフ用の履歴と、処理能力の計算に必要な作業者の情報）
+interface PrevChartData {
+  hist: HistPt[];
+  workers: { speed: number; assignedDests: number[] }[];
+}
+
+// グラフに描く系列（便フィルタの絞り込み・処理能力・5分ごとの投入量）を履歴から組み立てる。
+// 今回の結果と「前回結果を重ねる」の前回の結果で同じ計算を使う
+function buildChartSeries(
+  rawHist: HistPt[],
+  workers: { speed: number; assignedDests: number[] }[],
+  destFilter: ChartDestFilter | null,
+  speedOverrideSeconds: number | null,
+) {
+  // 便フィルタが指定されていれば、対象便の内訳だけを合算した系列に差し替える
+  const hist: { t: number; belt: number; spawned: number; done: number; flights: number; picked?: number }[] = destFilter
+    ? rawHist.map(hp => {
+        let belt = 0, spawned = 0, done = 0, flights = 0, picked = 0;
+        for (const d of destFilter.indices) {
+          belt += hp.beltByDest[d] ?? 0;
+          spawned += hp.spawnedByDest[d] ?? 0;
+          done += hp.doneByDest[d] ?? 0;
+          picked += hp.pickedByDest?.[d] ?? 0;
+          if ((hp.beltByDest[d] ?? 0) > 0) flights++;
+        }
+        return { t: hp.t, belt, spawned, done, flights, picked };
+      })
+    : rawHist;
+
+  // 「5分ごとの処理能力」: 各記録時点でベルトに配置（表示）されていた作業者ごとに 300秒÷（処理秒数＋移動待機秒数）を合計する
+  // （床置きの追加時間・ピック確率は含めない、直搭載のみの理論上限）。便フィルタ中は対象便を1つ以上担当する作業者だけで計算し、
+  // 個別処理速度が設定されていればその秒数を使う
+  const capacityPts = rawHist.map(hp => {
+    const travel = hp.travel ?? 0;
+    const ids = hp.activeWorkerIds ?? workers.map((_, wi) => wi);
+    let cap = 0;
+    for (const wi of ids) {
+      const wk = workers[wi];
+      if (!wk) continue;
+      if (destFilter && !wk.assignedDests.some(d => destFilter.indices.includes(d))) continue;
+      const procSec = destFilter && speedOverrideSeconds !== null ? speedOverrideSeconds : 1 / wk.speed;
+      const cycle = procSec + travel;
+      if (cycle > 0) cap += BUCKET_SEC / cycle;
+    }
+    return { t: hp.t, cap };
+  });
+
+  // 「5分ごとの投入量」用に、投入量（累計・spawned）の履歴からBUCKET_SEC刻みの差分を算出する
+  const bucketAmounts: { start: number; amount: number }[] = [];
+  {
+    let curBucket = -1;
+    let bucketStartCum = 0;
+    let lastCum = 0;
+    for (const hp of hist) {
+      const bIdx = Math.floor(hp.t / BUCKET_SEC);
+      if (bIdx !== curBucket) {
+        if (curBucket >= 0) bucketAmounts.push({ start: curBucket * BUCKET_SEC, amount: lastCum - bucketStartCum });
+        bucketStartCum = lastCum;
+        curBucket = bIdx;
+      }
+      lastCum = hp.spawned;
+    }
+    if (curBucket >= 0) bucketAmounts.push({ start: curBucket * BUCKET_SEC, amount: lastCum - bucketStartCum });
+  }
+  return { hist, capacityPts, bucketAmounts };
+}
+
+function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCapacity: number, outerLaneCapacity: number, visible: ChartSeriesVisible, rect: { x: number; y: number; w: number; h: number }, destFilter: ChartDestFilter | null = null, nominalLaneCapacityTotal: number | null = null, speedOverrideSeconds: number | null = null, prevChart: PrevChartData | null = null) {
   // nominalLaneCapacityTotal: スライダーで設定した「外側上限＋内側上限」（無制限モードでも設定値のまま）。累計表示の配置に使う
   const { x, y, w, h } = rect;
   const pad = { l: 52, r: 44, t: 48, b: 32 };
@@ -1322,71 +1433,36 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     return;
   }
 
-  // 便フィルタが指定されていれば、対象便の内訳だけを合算した系列に差し替える
-  const hist = destFilter
-    ? rawHist.map(hp => {
-        let belt = 0, spawned = 0, done = 0, flights = 0;
-        for (const d of destFilter.indices) {
-          belt += hp.beltByDest[d] ?? 0;
-          spawned += hp.spawnedByDest[d] ?? 0;
-          done += hp.doneByDest[d] ?? 0;
-          if ((hp.beltByDest[d] ?? 0) > 0) flights++;
-        }
-        return { t: hp.t, belt, spawned, done, flights };
-      })
-    : rawHist;
+  const cur = buildChartSeries(rawHist, s.workers, destFilter, speedOverrideSeconds);
+  const { hist } = cur;
+  // 「前回結果を重ねる」がONで前回の結果があれば、同じ方法で系列を組み立てて半透明で重ねる
+  const prev = prevChart && prevChart.hist.length >= 2
+    ? buildChartSeries(prevChart.hist, prevChart.workers, destFilter, speedOverrideSeconds)
+    : null;
 
   const maxAll = 250;
 
-  // 常に t=0 から全履歴を表示（0m が左端に固定）
+  // 常に t=0 から全履歴を表示（0m が左端に固定）。前回の結果を重ねるときは、今回と前回の長いほうに合わせる
   const startT = 0;
-  const endT = hist[hist.length - 1].t;
+  const endT = Math.max(hist[hist.length - 1].t, prev ? prev.hist[prev.hist.length - 1].t : 0);
   const spanT = Math.max(endT - startT, 1);
 
   const px = (t: number) => x + pad.l + ((t - startT) / spanT) * gw;
   const py = (v: number) => y + pad.t + gh - (v / maxAll) * gh;
 
-  // 「5分ごとの投入量」棒グラフ用に、投入量（累計・spawned）の履歴からBUCKET_SEC刻みの差分を算出する
-  const bucketAmounts: { start: number; amount: number }[] = [];
-  {
-    let curBucket = -1;
-    let bucketStartCum = 0;
-    let lastCum = 0;
-    for (const hp of hist) {
-      const bIdx = Math.floor(hp.t / BUCKET_SEC);
-      if (bIdx !== curBucket) {
-        if (curBucket >= 0) bucketAmounts.push({ start: curBucket * BUCKET_SEC, amount: lastCum - bucketStartCum });
-        bucketStartCum = lastCum;
-        curBucket = bIdx;
-      }
-      lastCum = hp.spawned;
-    }
-    if (curBucket >= 0) bucketAmounts.push({ start: curBucket * BUCKET_SEC, amount: lastCum - bucketStartCum });
-  }
-  // 「処理済」（5分ごとの処理数）用に、処理済（累計・done）の履歴からBUCKET_SEC刻みの差分を算出する（投入量と同じ方法）
-  const doneBucketAmounts: { start: number; amount: number }[] = [];
-  {
-    let curBucket = -1;
-    let bucketStartCum = 0;
-    let lastCum = 0;
-    for (const hp of hist) {
-      const bIdx = Math.floor(hp.t / BUCKET_SEC);
-      if (bIdx !== curBucket) {
-        if (curBucket >= 0) doneBucketAmounts.push({ start: curBucket * BUCKET_SEC, amount: lastCum - bucketStartCum });
-        bucketStartCum = lastCum;
-        curBucket = bIdx;
-      }
-      lastCum = hp.done;
-    }
-    if (curBucket >= 0) doneBucketAmounts.push({ start: curBucket * BUCKET_SEC, amount: lastCum - bucketStartCum });
-  }
-
-  // 右軸: 「5分ごとの投入量」「処理済（5分ごとの処理数）」選択時は常に250個で固定、「行先便数」選択時はその最大値、
-  // それ以外は投入済み荷物量（累計・単調増加なので最終値）を基準に上限を決める
-  const flightsMaxVal = hist.reduce((m, h) => Math.max(m, h.flights), 0);
-  const rightMax = (visible.bucketSpawn || visible.done) ? 250
-    : visible.flights ? niceCeil(Math.max(1, flightsMaxVal))
-    : niceCeil(hist[hist.length - 1].spawned);
+  // 右軸: 「行先便数」選択時はその最大値、「取り出し数」（累計）選択時は累計投入数（単調増加なので最終値）を基準に上限を決める。
+  // 処理能力を表示中は0〜1500個で固定（便フィルタ選択中は0〜750個。同時表示の5分ごとの投入量も同じ目盛り）、
+  // それ以外（5分ごとの投入量のみ）は250個
+  // （前回の結果を重ねるときは、行先便数・取り出し数の上限を今回と前回の大きいほうに合わせる）
+  const flightsMaxVal = Math.max(
+    hist.reduce((m, h) => Math.max(m, h.flights), 0),
+    prev ? prev.hist.reduce((m, h) => Math.max(m, h.flights), 0) : 0,
+  );
+  const spawnedMaxVal = Math.max(hist[hist.length - 1].spawned, prev ? prev.hist[prev.hist.length - 1].spawned : 0);
+  const rightMax = visible.flights ? niceCeil(Math.max(1, flightsMaxVal))
+    : visible.picked ? niceCeil(spawnedMaxVal)
+    : visible.capacity ? (destFilter ? CAPACITY_AXIS_MAX_FILTERED : CAPACITY_AXIS_MAX)
+    : 250;
   const pyRight = (v: number) => y + pad.t + gh - (v / rightMax) * gh;
 
   const yTicks = [0, 50, 100, 150, 200, 250];
@@ -1397,59 +1473,77 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.beginPath(); ctx.moveTo(x + pad.l, gy); ctx.lineTo(x + w - pad.r, gy); ctx.stroke();
   }
 
-  // 5分ごとの投入量（細線・右軸）。各区間の中央時刻の値を細い線でつなぐ。
-  // 「ベルト上の荷物」より先に描画することで、重なった際に背面に来るようにする。
-  if (visible.bucketSpawn) {
+  // 系列の線を描く（今回の結果と、前回の結果〔半透明・背面〕で共通）
+  const drawSeriesLines = (series: ReturnType<typeof buildChartSeries>) => {
+    // 5分ごとの投入量（細線・右軸）。各区間の中央時刻の値を細い線でつなぐ。
+    // 「ベルト上の荷物」より先に描画することで、重なった際に背面に来るようにする。
+    if (visible.bucketSpawn) {
+      ctx.save();
+      ctx.beginPath();
+      series.bucketAmounts.forEach((b, i) => {
+        const bx = px(b.start + BUCKET_SEC / 2);
+        const by = pyRight(b.amount);
+        if (i === 0) ctx.moveTo(bx, by); else ctx.lineTo(bx, by);
+      });
+      ctx.strokeStyle = '#EC4899'; ctx.lineWidth = 0.6; ctx.stroke();
+      ctx.restore();
+    }
+
+    if (visible.belt) {
+      ctx.beginPath();
+      series.hist.forEach((h, i) => {
+        const v = Math.min(h.belt as number, maxAll);
+        if (i === 0) ctx.moveTo(px(h.t), py(v)); else ctx.lineTo(px(h.t), py(v));
+      });
+      ctx.strokeStyle = '#3B82F6'; ctx.lineWidth = 1.8; ctx.stroke();
+    }
+
+    // 5分ごとの処理能力（右軸・点線）ライン。実績ではない理論上限のため点線で区別する。
+    // 右軸の上限（1500個、便フィルタ選択中は750個）を超える値は上端で止め、枠からはみ出さないようにする
+    if (visible.capacity) {
+      ctx.save();
+      ctx.beginPath();
+      series.capacityPts.forEach((p, i) => {
+        const v = Math.min(p.cap, rightMax);
+        if (i === 0) ctx.moveTo(px(p.t), pyRight(v)); else ctx.lineTo(px(p.t), pyRight(v));
+      });
+      ctx.strokeStyle = '#C084FC'; ctx.lineWidth = 1.8; ctx.setLineDash([6, 4]); ctx.stroke();
+      ctx.restore();
+    }
+
+    // 取り出し数（累計・右軸）ラインと、対になる累計投入数ライン。2本のすき間＝ベルト上の荷物数＋オーバーフロー破棄数
+    if (visible.picked) {
+      ctx.beginPath();
+      series.hist.forEach((h, i) => {
+        if (i === 0) ctx.moveTo(px(h.t), pyRight(h.spawned)); else ctx.lineTo(px(h.t), pyRight(h.spawned));
+      });
+      ctx.strokeStyle = '#EC4899'; ctx.lineWidth = 1.8; ctx.stroke();
+      ctx.beginPath();
+      series.hist.forEach((h, i) => {
+        const v = h.picked ?? 0;
+        if (i === 0) ctx.moveTo(px(h.t), pyRight(v)); else ctx.lineTo(px(h.t), pyRight(v));
+      });
+      ctx.strokeStyle = '#22C55E'; ctx.lineWidth = 1.8; ctx.stroke();
+    }
+
+    // 行先便数（ベルト上にある荷物の行先の異なり数・右軸）ライン。同一行先便は1便として重複カウントしない。
+    if (visible.flights) {
+      ctx.beginPath();
+      series.hist.forEach((h, i) => {
+        const v = h.flights;
+        if (i === 0) ctx.moveTo(px(h.t), pyRight(v)); else ctx.lineTo(px(h.t), pyRight(v));
+      });
+      ctx.strokeStyle = '#FBBF24'; ctx.lineWidth = 0.6; ctx.stroke();
+    }
+  };
+  // 前回の結果: 今回と同じ色で透明度50%にし、今回の線の背面に描く
+  if (prev) {
     ctx.save();
-    ctx.beginPath();
-    bucketAmounts.forEach((b, i) => {
-      const bx = px(b.start + BUCKET_SEC / 2);
-      const by = pyRight(b.amount);
-      if (i === 0) ctx.moveTo(bx, by); else ctx.lineTo(bx, by);
-    });
-    ctx.strokeStyle = '#EC4899'; ctx.lineWidth = 0.6; ctx.stroke();
+    ctx.globalAlpha = 0.5;
+    drawSeriesLines(prev);
     ctx.restore();
   }
-
-  if (visible.belt) {
-    ctx.beginPath();
-    hist.forEach((h, i) => {
-      const v = Math.min(h.belt as number, maxAll);
-      if (i === 0) ctx.moveTo(px(h.t), py(v)); else ctx.lineTo(px(h.t), py(v));
-    });
-    ctx.strokeStyle = '#3B82F6'; ctx.lineWidth = 1.8; ctx.stroke();
-  }
-
-  // 投入済み荷物量（累計・右軸）ライン
-  if (visible.spawned) {
-    ctx.beginPath();
-    hist.forEach((h, i) => {
-      const v = h.spawned;
-      if (i === 0) ctx.moveTo(px(h.t), pyRight(v)); else ctx.lineTo(px(h.t), pyRight(v));
-    });
-    ctx.strokeStyle = '#C084FC'; ctx.lineWidth = 1.8; ctx.stroke();
-  }
-
-  // 処理済み荷物量（5分ごとの処理数・右軸）ライン。各区間の中央時刻の値をつなぐ
-  if (visible.done) {
-    ctx.beginPath();
-    doneBucketAmounts.forEach((b, i) => {
-      const bx = px(b.start + BUCKET_SEC / 2);
-      const by = pyRight(b.amount);
-      if (i === 0) ctx.moveTo(bx, by); else ctx.lineTo(bx, by);
-    });
-    ctx.strokeStyle = '#22C55E'; ctx.lineWidth = 1.8; ctx.stroke();
-  }
-
-  // 行先便数（ベルト上にある荷物の行先の異なり数・右軸）ライン。同一行先便は1便として重複カウントしない。
-  if (visible.flights) {
-    ctx.beginPath();
-    hist.forEach((h, i) => {
-      const v = h.flights;
-      if (i === 0) ctx.moveTo(px(h.t), pyRight(v)); else ctx.lineTo(px(h.t), pyRight(v));
-    });
-    ctx.strokeStyle = '#FBBF24'; ctx.lineWidth = 0.6; ctx.stroke();
-  }
+  drawSeriesLines(cur);
 
   // 内側レーン上限（オーバーフロー）ライン（赤・太線・半透明）= 外側上限 + 内側上限
   // 上限を「無限」にしている場合はキャパという概念がなくなるため、赤線・ラベルとも非表示にする
@@ -1474,12 +1568,15 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
     ctx.fillText(tick === 0 ? '0' : `${tick}個`, x + pad.l - 3, py(tick));
   }
 
-  // Y-axis labels（右軸: 投入量・処理済 または 行先便数 または 5分ごとの投入量。左軸と同じ目盛位置に対応する値を表示）
-  // 単位は左軸と同様の付け方（0のときは単位なし）: 投入量・処理済は「個」、行先便数は「便」
-  // 行先便数・5分ごとの投入量は右軸を専有する排他系列のため、文字色もその系列の線色に合わせる
-  // 処理済のみ選択時は処理済の線色（緑）に合わせる（5分ごとの投入量と同時選択時は共有軸のためグレー）
+  // Y-axis labels（右軸: 5分ごとの投入量・処理能力 または 累計投入数・累計取り出し数 または 行先便数。左軸と同じ目盛位置に対応する値を表示）
+  // 単位は左軸と同様の付け方（0のときは単位なし）: 投入量・取り出し数・処理能力は「個」、行先便数は「便」
+  // 右軸の系列が1つだけのときは文字色をその線色に合わせ、複数同時表示のときは共有軸のためグレーにする
+  // （取り出し数は累計投入数と2本で表示するためグレー）
   const rightUnit = visible.flights ? '便' : '個';
-  const rightAxisColor = (visible.bucketSpawn && visible.done) ? '#94A3B8' : visible.bucketSpawn ? '#EC4899' : visible.flights ? '#FBBF24' : visible.done ? '#22C55E' : visible.spawned ? '#94A3B8' : '#374151';
+  const rightActiveColors = visible.flights ? ['#FBBF24']
+    : visible.picked ? ['#EC4899', '#22C55E']
+    : [visible.bucketSpawn ? '#EC4899' : null, visible.capacity ? '#C084FC' : null].filter((c): c is string => c !== null);
+  const rightAxisColor = rightActiveColors.length === 1 ? rightActiveColors[0] : rightActiveColors.length > 1 ? '#94A3B8' : '#374151';
   ctx.fillStyle = rightAxisColor; ctx.font = '18px sans-serif';
   ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
   for (const tick of yTicks) {
@@ -1543,20 +1640,33 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
   ctx.fillStyle = visible.belt ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
   ctx.fillText(legLabel1, legLx + 20, legLy1);
 
-  // 「行先便数」「5分ごとの投入量」選択時は投入量の代わりにそれぞれを2段目に表示する（右軸を共有できないため排他）
-  const legLabel2 = visible.bucketSpawn ? '5分ごとの投入量（右軸）' : visible.flights ? '行先便数（右軸）' : '投入量（右軸）';
-  const legLabel2Active = visible.flights || visible.bucketSpawn || visible.spawned;
-  const legLabel2Color = visible.bucketSpawn ? '#EC4899' : visible.flights ? '#FBBF24' : '#C084FC';
+  // 5分ごとの処理能力は、2段目が3項目で混み合う（右端の便フィルタ注記と被る）のを避けるため1段目の右隣に表示する。
+  // 点線の系列なので凡例の見本も点線にする（行先便数選択時は排他のため表示しない）
+  if (!visible.flights) {
+    const legLxCap = legLx + 20 + ctx.measureText(legLabel1).width + 30;
+    const legLabelCap = '5分ごとの処理能力（右軸）';
+    ctx.save();
+    ctx.strokeStyle = visible.capacity ? '#C084FC' : '#374151'; ctx.lineWidth = 2.5; ctx.setLineDash([5, 3]);
+    ctx.beginPath(); ctx.moveTo(legLxCap, legLy1 + 4); ctx.lineTo(legLxCap + 16, legLy1 + 4); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = visible.capacity ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
+    ctx.fillText(legLabelCap, legLxCap + 20, legLy1);
+  }
+
+  // 2段目: 行先便数選択時はそれのみ（右軸を専有する排他表示）。取り出し数選択時は累計投入数と累計取り出し数、
+  // それ以外は5分ごとの投入量と累計取り出し数を並べる
+  const legLabel2 = visible.flights ? '行先便数（右軸）' : visible.picked ? '累計投入数（右軸）' : '5分ごとの投入量（右軸）';
+  const legLabel2Active = visible.flights || visible.bucketSpawn || visible.picked;
+  const legLabel2Color = visible.flights ? '#FBBF24' : '#EC4899';
   ctx.fillStyle = legLabel2Active ? legLabel2Color : '#374151'; ctx.fillRect(legLx, legLy2, 16, 8);
   ctx.fillStyle = legLabel2Active ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
   ctx.fillText(legLabel2, legLx + 20, legLy2);
 
-  // 処理済（5分ごとの処理数）は「5分ごとの投入量」と右軸を共有できるため、行先便数選択時以外は表示する
   if (!visible.flights) {
     const legLx3 = legLx + ctx.measureText(legLabel2).width + 30;
-    const legLabel3 = '5分ごとの処理済（右軸）';
-    ctx.fillStyle = visible.done ? '#22C55E' : '#374151'; ctx.fillRect(legLx3, legLy2, 16, 8);
-    ctx.fillStyle = visible.done ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
+    const legLabel3 = '累計取り出し数（右軸）';
+    ctx.fillStyle = visible.picked ? '#22C55E' : '#374151'; ctx.fillRect(legLx3, legLy2, 16, 8);
+    ctx.fillStyle = visible.picked ? '#94A3B8' : '#4B5563'; ctx.textAlign = 'left';
     ctx.fillText(legLabel3, legLx3 + 20, legLy2);
   }
 
@@ -1583,6 +1693,15 @@ function drawInlineChart(ctx: CanvasRenderingContext2D, s: SimState, innerLaneCa
       `累床：${fmt(s.totalFloor)}　累直：${fmt(totalDirect)}　累１週：${fmt(lap1)}　累２週：${fmt(lap2)}　累３週：${fmt(lap3)}　累４週以上：${fmt(lap4)}`,
       x + pad.l + 2, placeBelow ? refLineY + 1.25 + 2 : cumAboveBottomY,
     );
+  }
+
+  // 前回の結果を重ねているときは、凡例2段目の右側に注記する（便フィルタの注記と被らないよう、その左に置く）
+  if (prev) {
+    ctx.font = '16px sans-serif';
+    ctx.fillStyle = '#94A3B8';
+    ctx.textAlign = 'right'; ctx.textBaseline = 'top';
+    const filterNoteW = destFilter ? ctx.measureText(`表示中: 便名に「${destFilter.label}」を含む便のみ`).width + 16 : 0;
+    ctx.fillText('半透明＝前回の結果', x + w - 6 - filterNoteW, legLy2);
   }
 
   // 便フィルタ適用中は、右パネルの統計（全便合算）とグラフの数値が一致しないことが分かるよう注記する
@@ -1675,7 +1794,8 @@ function drawStatsPanel(ctx: CanvasRenderingContext2D, s: SimState, simSpeed: nu
 }
 
 // ── Draw simulation canvas ───────────────────────────────────
-function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean, chartSeriesVisible: ChartSeriesVisible, chartDestFilter: ChartDestFilter | null = null, speedOverrideSeconds: number | null = null, nominalLaneCapacityTotal: number | null = null, departAnim: DepartAnimState | null = null) {
+function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: number[], innerLaneCapacity: number, outerLaneCapacity: number, clockwise: boolean, chartSeriesVisible: ChartSeriesVisible, chartDestFilter: ChartDestFilter | null = null, speedOverrideSeconds: number | null = null, nominalLaneCapacityTotal: number | null = null, departAnim: DepartAnimState | null = null, plannedMaxWorkers: number | null = null, prevChart: PrevChartData | null = null) {
+  // plannedMaxWorkers: 裏で最初から最後まで一括計算して求めた最大同時作業人数（「アサイン ○名」に最初から表示する計画値。計算前は null）
   const { workers, bags, beltW: BW, beltH: BH, beltR: BR, beltWidthPx } = s;
 
   ctx.fillStyle = '#111827';
@@ -1771,7 +1891,7 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
   // グラフはベルトと別の横位置（左枠ぎりぎり）に描くため、ベルト用txとグラフ用chartTxの差の分だけずらして描く
   ctx.save();
   ctx.translate((layout.chartTx - layout.tx) / layout.scale, 0);
-  drawInlineChart(ctx, s, innerLaneCapacity, outerLaneCapacity, chartSeriesVisible, layout.chart, chartDestFilter, nominalLaneCapacityTotal);
+  drawInlineChart(ctx, s, innerLaneCapacity, outerLaneCapacity, chartSeriesVisible, layout.chart, chartDestFilter, nominalLaneCapacityTotal, speedOverrideSeconds, prevChart);
   ctx.restore();
 
   // Injection points — arrow pointing outward (toward belt) from just inside inner edge
@@ -2526,7 +2646,8 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     ctx.save();
     ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
     ctx.font = 'bold 18px sans-serif'; ctx.fillStyle = '#FDE68A';
-    const workerValueText = `${s.maxActiveWorkers ?? 0}名`;
+    // その時点までの最大（s.maxActiveWorkers）ではなく、最後まで通した計画値を最初から表示する。計算前は「—名」
+    const workerValueText = `${plannedMaxWorkers ?? '—'}名`;
     ctx.fillText(workerValueText, valueRight, workerRowY);
     const workerValueW = ctx.measureText(workerValueText).width;
     ctx.font = 'bold 15px sans-serif';
@@ -2569,6 +2690,10 @@ function updateMaxBeltSnapshot(s: SimState, ref: { current: MaxBeltSnapshot }) {
 export default function BaggageSimulation() {
   const simCanvasRef          = useRef<HTMLCanvasElement>(null);
   const stateRef              = useRef<SimState | null>(null);
+  // 「アサイン ○名」の計画値（裏で最後まで一括計算した最大同時作業人数）。計算前は null
+  const plannedMaxWorkersRef  = useRef<number | null>(null);
+  // initSim（リセット）のたびに増やす。「ランダム」シードの引き直しも含めて計画値を計算し直すきっかけに使う
+  const [simInitVersion, setSimInitVersion] = useState(0);
   const lastTsRef             = useRef<number>(0);
   const runningRef            = useRef(false);
   const snapshotsRef          = useRef<SimState[]>([]);
@@ -2641,37 +2766,44 @@ export default function BaggageSimulation() {
   const [injectionRuleId, setInjectionRuleId] = useState<string>(INJECTION_RULES[0].id);
   // 乱数シードモード: 'fixed'=常に同じ結果（今までの挙動）/ 'random'=リセットのたびに結果が変わる
   const [rngMode, setRngMode] = useState<'fixed' | 'random'>('fixed');
-  const [chartSeriesVisible, setChartSeriesVisible] = useState<ChartSeriesVisible>({ belt: true, spawned: false, done: false, flights: false, bucketSpawn: true });
+  // 「前回結果を重ねる」: リセット直前の計算結果（prevChartRef）を、今回と同じ色・透明度50%でグラフに重ねるか
+  const prevChartRef = useRef<PrevChartData | null>(null);
+  const [hasPrevChart, setHasPrevChart] = useState(false);
+  const [showPrevChart, setShowPrevChart] = useState(false);
+  const [chartSeriesVisible, setChartSeriesVisible] = useState<ChartSeriesVisible>({ belt: true, capacity: false, picked: false, flights: false, bucketSpawn: true });
   const toggleChartSeries = (key: keyof ChartSeriesVisible) => {
     setChartSeriesVisible(prev => {
       if (key === 'flights') {
-        // 行先便数は右軸を専有する排他表示。ONにする際は、投入量・処理済・5分ごとの投入量をすべてOFFにする。
+        // 行先便数は右軸を専有する排他表示。ONにする際は、5分ごとの投入量・取り出し数・処理能力をすべてOFFにする。
         const next = !prev.flights;
         return {
           ...prev,
           flights: next,
           bucketSpawn: next ? false : prev.bucketSpawn,
-          spawned: next ? false : prev.spawned,
-          done: next ? false : prev.done,
+          capacity: next ? false : prev.capacity,
+          picked: next ? false : prev.picked,
+        };
+      }
+      if (key === 'picked') {
+        // 取り出し数（累計）は右軸が累計の桁になるため排他。ONにする際は5分ごとの投入量・処理能力・行先便数をOFFにする。
+        const next = !prev.picked;
+        return {
+          ...prev,
+          picked: next,
+          bucketSpawn: next ? false : prev.bucketSpawn,
+          capacity: next ? false : prev.capacity,
+          flights: next ? false : prev.flights,
         };
       }
       if (key === 'bucketSpawn') {
-        // 5分ごとの投入量は処理済（5分ごとの処理数）と右軸（0〜250個）を共有できる。
-        // ONにする際は、行先便数・投入量（累計）をOFFにする（処理済はそのまま）。
+        // 5分ごとの投入量は処理能力と右軸を共有できる。ONにする際は行先便数・取り出し数をOFFにする。
         const next = !prev.bucketSpawn;
-        return {
-          ...prev,
-          bucketSpawn: next,
-          flights: next ? false : prev.flights,
-          spawned: next ? false : prev.spawned,
-        };
+        return { ...prev, bucketSpawn: next, flights: next ? false : prev.flights, picked: next ? false : prev.picked };
       }
-      // 行先便数がON中は投入量・処理済を、5分ごとの投入量がON中は投入量（累計）を選択できない
-      if (prev.flights && (key === 'spawned' || key === 'done')) return prev;
-      if (prev.bucketSpawn && key === 'spawned') return prev;
-      // 投入量（累計）と処理済（5分ごと）は右軸の桁が異なるため排他。片方をONにするともう片方をOFFにする
-      if (key === 'spawned' && !prev.spawned) return { ...prev, spawned: true, done: false };
-      if (key === 'done' && !prev.done) return { ...prev, done: true, spawned: false };
+      // 行先便数がON中は処理能力を選択できない
+      if (prev.flights && key === 'capacity') return prev;
+      // 処理能力をONにする際は取り出し数（累計）をOFFにする
+      if (key === 'capacity' && !prev.capacity) return { ...prev, capacity: true, picked: false };
       return { ...prev, [key]: !prev[key] };
     });
   };
@@ -2833,6 +2965,15 @@ export default function BaggageSimulation() {
   }, [chartDestFilter, filteredFlightSpeed]);
 
   const initSim = useCallback(() => {
+    // 「前回結果を重ねる」用: リセット直前までの計算結果（途中まででも可）を前回の結果として保存する（1つだけ保持し上書き）
+    const prevState = stateRef.current;
+    if (prevState && prevState.hist.length >= 2) {
+      prevChartRef.current = {
+        hist: prevState.hist,
+        workers: prevState.workers.map(w => ({ speed: w.speed, assignedDests: [...w.assignedDests] })),
+      };
+      setHasPrevChart(true);
+    }
     // 「ランダム」モードならこの初期化のたびに新しいシードを引く。「固定」モードは常にSIM_RNG_SEED。
     activeSeedRef.current = rngMode === 'random' ? drawRandomSeed() : SIM_RNG_SEED;
     const q = destQuantitiesRef.current;
@@ -2854,6 +2995,7 @@ export default function BaggageSimulation() {
     lastTsRef.current = 0;
     maxBeltSnapshotRef.current = { count: -1, snapshot: null };
     setHasPeakCapture(false);
+    setSimInitVersion(v => v + 1);
   }, [workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, rngMode]);
 
   useEffect(() => { initSim(); }, [initSim]);
@@ -2915,7 +3057,7 @@ export default function BaggageSimulation() {
       const simCtx = simCanvasRef.current?.getContext('2d');
       if (simCtx) {
         updateDepartAnim(displayState, destQuantities, departAnimRef.current, performance.now());
-        drawSim(simCtx, displayState, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null, nominalLaneCapacityTotal, departAnimRef.current);
+        drawSim(simCtx, displayState, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null, nominalLaneCapacityTotal, departAnimRef.current, plannedMaxWorkersRef.current, showPrevChart ? prevChartRef.current : null);
         if (isRecordingRef.current && offscreenCanvasRef.current && simCanvasRef.current) {
           const offCtx = offscreenCanvasRef.current.getContext('2d');
           if (offCtx) {
@@ -2957,7 +3099,7 @@ export default function BaggageSimulation() {
     };
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
-  }, [syncDestColorsUi, arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId, chartSeriesVisible, chartDestFilter, speedOverride, nominalLaneCapacityTotal]);
+  }, [syncDestColorsUi, arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId, chartSeriesVisible, chartDestFilter, speedOverride, nominalLaneCapacityTotal, showPrevChart]);
 
   const toggleRunning = () => {
     if (!runningRef.current && scrubIndexRef.current !== null) {
@@ -3088,6 +3230,47 @@ export default function BaggageSimulation() {
   // 実測時間を記憶して次回以降の「見込み時間」表示に使う。
   const [isBatchComputing, setIsBatchComputing] = useState(false);
   const lastBatchComputeMsRef = useRef<number | null>(null);
+  // 「アサイン ○名」の計画値: 「搭載終了」と同じ条件（同じシード・パラメータ・刻み）で、画面には出さずに最初から
+  // 最後まで計算し、その回の最大同時作業人数（maxActiveWorkers）を求める。スナップショット保存・画面更新はしない。
+  // リセット・パラメータ・エクセル読み込みが変わるたびに、操作が止まってから約0.3秒後に1回だけ計算し直す
+  useEffect(() => {
+    plannedMaxWorkersRef.current = null;
+    const timer = setTimeout(() => {
+      const workerLayout = computeWorkerEdgeLayout(workerCount, beltLongSide, beltShortSide,
+        computeWorkerLoads(workerCount, workerDests, destQuantities), computeWorkerContainerCounts(workerCount, workerDests, destQuantities));
+      const s = makeState(
+        generateWorkerPositions(workerLayout, workerCount),
+        workerSpeeds.slice(0, workerCount),
+        workerDests,
+        beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
+        excelFlightEventsRef.current,
+        activeSeedRef.current,
+        workerLayout,
+      );
+      const circuitsPerSec = beltSpeedMS / (s.beltPerim / PIXELS_PER_METER);
+      const dt = 2.0; // runToCompletion と同じ（内部で0.1秒刻みに分割される）
+      const MAX_ITER = 100000;
+      for (let i = 0; i < MAX_ITER; i++) {
+        s.workers.forEach((w, wi) => {
+          w.speed = 1 / (workerSpeeds[wi] ?? 10);
+          w.assignedDests = workerDests[wi] ?? [];
+        });
+        step(s, dt, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities,
+             pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride);
+        const aSet = new Set(s.workers.flatMap(w => w.assignedDests));
+        const tLimit = destQuantities.reduce((a, b, idx2) => aSet.has(idx2) ? a + b : a, 0);
+        const tSpawn = s.spawnedByDest.reduce((a, b, idx2) => aSet.has(idx2) ? a + b : a, 0);
+        const beltEmpty = s.bags.filter(b => b.state === 'belt').length === 0;
+        const idle = s.workers.every(w => w.queue.length === 0 && !w.current && !w.activeFloor && w.floorQueue.length === 0);
+        if (tLimit > 0 && tSpawn >= tLimit && beltEmpty && idle) break;
+      }
+      plannedMaxWorkersRef.current = s.maxActiveWorkers ?? 0;
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [simInitVersion, excelFileName, workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
+      beltSpeedMS, arrivalInterval, floorDropProb, destQuantities, pickupRate, pickupForceThreshold,
+      effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride]);
+
   const handleRunToCompletionClick = useCallback(() => {
     setIsBatchComputing(true);
     setTimeout(() => {
@@ -3226,7 +3409,7 @@ export default function BaggageSimulation() {
     }
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    drawSim(ctx, snap, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null, nominalLaneCapacityTotal);
+    drawSim(ctx, snap, destQuantities, effInnerLaneCapacity, effOuterLaneCapacity, clockwise, chartSeriesVisible, chartDestFilter, speedOverride?.seconds ?? null, nominalLaneCapacityTotal, null, plannedMaxWorkersRef.current);
     const dataUrl = canvas.toDataURL('image/png');
     const a = document.createElement('a');
     a.href = dataUrl;
@@ -3526,18 +3709,25 @@ export default function BaggageSimulation() {
                 行先便数
               </button>
               <button
-                onClick={() => toggleChartSeries('spawned')}
-                disabled={chartSeriesVisible.flights || chartSeriesVisible.bucketSpawn}
-                className={`px-3 py-1 rounded text-xs font-medium border ${(chartSeriesVisible.flights || chartSeriesVisible.bucketSpawn) ? 'bg-gray-900 border-gray-800 text-gray-700 cursor-not-allowed' : chartSeriesVisible.spawned ? 'bg-purple-600 border-purple-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
+                onClick={() => toggleChartSeries('capacity')}
+                disabled={chartSeriesVisible.flights}
+                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.flights ? 'bg-gray-900 border-gray-800 text-gray-700 cursor-not-allowed' : chartSeriesVisible.capacity ? 'bg-purple-600 border-purple-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
               >
-                投入量
+                処理能力
               </button>
               <button
-                onClick={() => toggleChartSeries('done')}
-                disabled={chartSeriesVisible.flights}
-                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.flights ? 'bg-gray-900 border-gray-800 text-gray-700 cursor-not-allowed' : chartSeriesVisible.done ? 'bg-green-600 border-green-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
+                onClick={() => toggleChartSeries('picked')}
+                className={`px-3 py-1 rounded text-xs font-medium border ${chartSeriesVisible.picked ? 'bg-green-600 border-green-400 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
               >
-                処理済
+                取り出し数
+              </button>
+              {/* 前回結果を重ねる: リセット直前の計算結果を今回と同じ色・透明度50%で重ねる（前回の結果がないときは押せない） */}
+              <button
+                onClick={() => setShowPrevChart(v => !v)}
+                disabled={!hasPrevChart}
+                className={`px-3 py-1 rounded text-xs font-medium border ${!hasPrevChart ? 'bg-gray-900 border-gray-800 text-gray-700 cursor-not-allowed' : showPrevChart ? 'bg-slate-500 border-slate-300 text-white' : 'bg-gray-800 border-gray-600 text-gray-500'}`}
+              >
+                前回結果を重ねる
               </button>
             </div>
 
@@ -3598,7 +3788,9 @@ export default function BaggageSimulation() {
         </div>
       </div>
 
-      <div className="flex gap-4 flex-wrap">
+      {/* 全体設定・作業者別処理速度の2枠は画面幅の3分の2に収め、右の3分の1は今後の別項目用に空けておく */}
+      <div className="flex gap-4">
+      <div className="w-2/3 flex gap-4 flex-wrap">
 
         {/* 全体設定 */}
         <div className="flex-1 min-w-60 bg-gray-900 rounded-lg p-4 border border-gray-700 space-y-3">
@@ -3691,7 +3883,7 @@ export default function BaggageSimulation() {
           <Slider label={`ピックアップ率: ${(pickupRate * 100).toFixed(0)}%`} min={0}   max={1}    step={0.05}  value={pickupRate}     onChange={setPickupRate} />
           <Slider label={`100％ピックアップ荷物数（ベルト上）: ${pickupForceThreshold} 個以下`} min={10} max={100} step={5} value={pickupForceThreshold} onChange={setPickupForceThreshold} />
           <Slider label={`床置き確率: ${(floorDropProb * 100).toFixed(0)}%`} min={0}    max={1}    step={0.05}  value={floorDropProb}  onChange={setFloorDropProb} />
-          <Slider label={`移動/荷物探し時間: +${workerTravelTime} 秒/個`} min={0} max={10} step={0.5} value={workerTravelTime} onChange={setWorkerTravelTime} />
+          <Slider label={`搭載後の移動/荷物探し時間: +${workerTravelTime} 秒/個`} min={0} max={10} step={0.5} value={workerTravelTime} onChange={setWorkerTravelTime} />
           <Slider label={`床置き追加時間: +${floorExtraTime} 秒（通常の処理時間に上乗せ）`}           min={0}    max={30}   step={1}     value={floorExtraTime} onChange={setFloorExtraTime} />
           <Slider label={`床仮置き上限: ${floorMax} 個`}                    min={1}    max={20}   step={1}     value={floorMax}       onChange={setFloorMax} />
           <Slider label={`床仮置き一括処理閾値: ${floorBatchThreshold} 個`} min={1}    max={20}   step={1}     value={floorBatchThreshold} onChange={setFloorBatchThreshold} />
@@ -3826,45 +4018,7 @@ export default function BaggageSimulation() {
           })}
         </div>
 
-        {/* 待ち行列比較 */}
-        <div className="flex-1 min-w-48 bg-gray-900 rounded-lg p-4 border border-gray-700">
-          <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">待ち行列比較</div>
-          {stats.slice(0, workerCount).map((st, i) => {
-            const total = st.q + st.floor;
-            const maxScale = 20;
-            const qRatio = Math.min(st.q / maxScale, 1);
-            const floorRatio = Math.min(st.floor / maxScale, 1);
-            const col = total >= 11 ? 'bg-red-500' : total >= 6 ? 'bg-yellow-500' : 'bg-green-500';
-            const floorCol = total >= 11 ? 'bg-red-300' : total >= 6 ? 'bg-yellow-300' : 'bg-green-300';
-            const isMax = total === Math.max(...stats.slice(0, workerCount).map(s => s.q + s.floor));
-            return (
-              <div key={i} className="mb-3">
-                <div className="flex items-center gap-2 mb-0.5">
-                  <span className="text-xs w-10 text-gray-400">作業{i + 1}</span>
-                  <div className="flex-1 bg-gray-800 rounded h-4 overflow-hidden flex">
-                    <div className={`h-full transition-all duration-200 ${col}`} style={{ width: `${qRatio * 100}%` }} />
-                    <div className={`h-full transition-all duration-200 ${floorCol} opacity-70`} style={{ width: `${floorRatio * 100}%` }} />
-                  </div>
-                  <span className={`text-xs w-6 text-right ${isMax && total > 0 ? 'text-red-400 font-bold' : 'text-gray-400'}`}>{total}</span>
-                  {isMax && total >= 5 && <span className="text-red-400 text-xs">⚠</span>}
-                </div>
-                <div className="flex gap-3 ml-12 text-xs text-gray-500">
-                  <span>待ち: {st.q}個</span>
-                  <span>床: {st.floor}個</span>
-                  <span>済: {st.done + st.floorDone}個</span>
-                </div>
-              </div>
-            );
-          })}
-          <div className="mt-3 pt-3 border-t border-gray-700 text-xs text-gray-500 space-y-1">
-            <div>■ 濃色: 待ちキュー　■ 淡色: 床仮置き</div>
-            <div>△ 2周目の荷物</div>
-            <div>× 3周目の荷物</div>
-            <div>☆ 4周目以上の荷物</div>
-            <div>床仮置き: 処理速度+{floorExtraTime}秒・最大{floorMax}個</div>
-          </div>
-        </div>
-
+      </div>
       </div>
 
       {/* 行先便別投入数設定 */}
