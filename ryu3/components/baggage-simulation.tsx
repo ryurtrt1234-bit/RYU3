@@ -589,6 +589,8 @@ interface SimState {
   emergencyStop: boolean;
   emergencyStopCount: number;
   emergencyStopTotalTime: number;
+  // 最大同時作業人数: 最初の荷物の投入以降、ベルトに配置（表示）されていた作業者数（ベルト中央の「○名配置」と同じ数え方）の最大値。表示専用
+  maxActiveWorkers: number;
   // 「エクセル読み込み」ルール用: 便ごとの投入スケジュール（時刻順）と、次に処理すべき位置
   flightEvents: FlightSpawnEvent[] | null;
   flightEventIdx: number;
@@ -743,6 +745,7 @@ function makeState(
     emergencyStop: false,
     emergencyStopCount: 0,
     emergencyStopTotalTime: 0,
+    maxActiveWorkers: 0,
     flightEvents: flightEvents && flightEvents.length > 0 ? flightEvents : null,
     flightEventIdx: 0,
     rngState: rngSeed | 0,
@@ -1232,6 +1235,12 @@ function stepOnce(
     if (totalLimitC > 0 && totalSpawnedC >= totalLimitC && beltEmptyC && allIdleC) {
       s.completedTime = s.time;
     }
+  }
+
+  // 最大同時作業人数（最初の荷物の投入以降のみ数える。表示専用でシミュレーションの挙動には影響しない）
+  if (s.spawnedByDest.some(n => n > 0)) {
+    const activeNow = s.workers.filter(w => w.visible).length;
+    if (activeNow > (s.maxActiveWorkers ?? 0)) s.maxActiveWorkers = activeNow;
   }
 
   // Record history every second — keep full history (no rolling cap) so x-axis always starts at 0s
@@ -2504,6 +2513,25 @@ function drawSim(ctx: CanvasRenderingContext2D, s: SimState, destQuantities: num
     const bagValueText = `${s.totalDone}/${totalBags}個`;
     ctx.fillText(bagValueText, valueRight, bagRowY); // ラベル文字（「総取扱い荷物数」）は表示しない
     ctx.restore();
+
+    // アサイン（3行目。最大同時作業人数を同じ並びで「アサイン ○名 [人のアイコン]」）。グラフの横幅は変えない（ベルトが短いとグラフ枠と重なり得る）
+    const workerRowY = rowY + 56;
+    ctx.save();
+    // 人のアイコン（図形で描く。飛行機・荷物アイコンと同じ幅・同じ青）
+    ctx.translate(planeCx, workerRowY);
+    ctx.fillStyle = '#60A5FA';
+    ctx.beginPath(); ctx.arc(0, -6, 5, 0, Math.PI * 2); ctx.fill(); // 頭
+    ctx.beginPath(); ctx.roundRect(-9, 1, 18, 10, [6, 6, 1, 1]); ctx.fill(); // 胴体
+    ctx.restore();
+    ctx.save();
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
+    ctx.font = 'bold 18px sans-serif'; ctx.fillStyle = '#FDE68A';
+    const workerValueText = `${s.maxActiveWorkers ?? 0}名`;
+    ctx.fillText(workerValueText, valueRight, workerRowY);
+    const workerValueW = ctx.measureText(workerValueText).width;
+    ctx.font = 'bold 15px sans-serif';
+    ctx.fillText('アサイン', valueRight - workerValueW - 6, workerRowY);
+    ctx.restore();
   }
 
 }
@@ -3363,13 +3391,13 @@ export default function BaggageSimulation() {
           {/* 便フィルタで選択中の総便数（フィルタ有効時のみ表示）。
               グラフ本体のサイズ・レイアウト計算には影響を与えず、キャンバス右端の枠ギリギリ
               （SCENE_OUTER_MARGIN分の余白のみ）にオーバーレイ表示する。上下位置はグラフ矩形の
-              上端（chartFinal.y）から、キャンバスに描く「総出発便数」「総取扱い荷物数」の2行（各高さ約28px）の下へずらす。 */}
+              上端（chartFinal.y）から、キャンバスに描く「総出発便数」「総取扱い荷物数」「アサイン」の3行（各高さ約28px）の下へずらす。 */}
           {chartDestFilter && chartDestFilter.indices.length > 0 && (
             <div
               className="absolute flex flex-col gap-2"
               style={{
                 right: `${(SCENE_OUTER_MARGIN / SW * 100).toFixed(1)}%`,
-                top: `${((sceneLayout.chartFinal.y + 60) / SH * 100).toFixed(1)}%`,
+                top: `${((sceneLayout.chartFinal.y + 88) / SH * 100).toFixed(1)}%`,
                 zIndex: 5,
               }}
             >
