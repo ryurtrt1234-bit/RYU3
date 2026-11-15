@@ -1198,14 +1198,6 @@ function stepOnce(
   }
   s.bags = s.bags.filter(b => b.state !== 'floor');
 
-  const beltCountNow = s.bags.filter(b => b.state === 'belt').length;
-  const beltSparse = beltCountNow <= (outerLaneCapacity + innerLaneCapacity) / 2;
-
-  // 床仮置き積極化中（ベルト上が床仮置き積極化 ベルト数閾値以上）は、床に置くだけに専念し床からの積み込みを新しく始めない
-  // （直搭載の待ち行列と、積み込み中の1個はそのまま続ける）。閾値未満になったら床からの積み込みを再開する。
-  // 緊急停止中は解除に床の荷物の積み込み完了が必要なため例外とし、ベルト上の数に関係なく床から積み込む
-  const floorAggressive = !s.emergencyStop && s.bags.filter(b => b.state === 'belt').length >= beltFloorTrigger;
-
   for (const w of s.workers) {
     // 排他処理: 通常処理中は床仮置き処理不可、床仮置き処理中は通常処理不可
     if (w.current && (w.findTimer ?? 0) > 0) {
@@ -1247,22 +1239,10 @@ function stepOnce(
     } else if (w.travelTimer > 0) {
       // 移動/荷物探し待機中
       w.travelTimer = Math.max(0, w.travelTimer - dt);
-    } else if (floorAggressive) {
-      // 床仮置き積極化中: 直搭載の待ち行列があれば先に処理する。床の荷物が床仮置き上限に達している作業者は床から1個積み込み、
-      // 上限未満の作業者は床からの積み込みを始めず（一括処理も中断）床に置くことに専念する
-      w.floorBatchActive = false;
-      if (w.queue.length > 0) {
-        w.current = w.queue.shift()!;
-        w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride) + floorExtraTime; // 直搭載＝②（または個別処理速度）＋⑤搭載調整時間
-        w.activeProcPt = w.procTimer;
-        w.findTimer = findTime; // ①見つける（積み込み前の待ち）
-      } else if (w.floorQueue.length >= floorMax) {
-        w.activeFloor = w.floorQueue.shift()!;
-        w.activeFloor.timer = w.activeFloor.maxTimer;
-        w.findTimer = findTime; // ①見つける（積み込み前の待ち）
-      }
     } else {
-      // 優先順位: バッチ継続 > [スパース時]床置き優先 > ベルトキュー > [アイドル時]床置き
+      // 優先順位: バッチ継続 > 床の荷物が一括処理閾値（または床仮置き上限の小さいほう）以上で一括処理開始 > ベルトキュー >
+      // [緊急停止中のみ]閾値未満でも床置きを処理。床の荷物は閾値に達するまで溜め、それまでは手が空いたらベルトから荷物を取る
+      const floorBatchTrigger = Math.max(1, Math.min(floorBatchThreshold, floorMax));
       if (w.floorBatchActive) {
         if (w.floorQueue.length > 0) {
           // バッチ継続: 次の床仮置きを処理
@@ -1279,8 +1259,8 @@ function stepOnce(
             w.findTimer = findTime; // ①見つける（積み込み前の待ち）
           }
         }
-      } else if (beltSparse && w.floorQueue.length >= floorBatchThreshold && w.queue.length === 0) {
-        // ベルトが半分以下かつ床仮置きが閾値以上のとき一括処理
+      } else if (w.floorQueue.length >= floorBatchTrigger && w.queue.length === 0) {
+        // 床仮置きが一括処理閾値（または床仮置き上限の小さいほう）以上のとき、ベルト上の数に関係なく一括処理
         w.floorBatchActive = true;
         w.activeFloor = w.floorQueue.shift()!;
         w.activeFloor.timer = w.activeFloor.maxTimer;
@@ -1291,8 +1271,8 @@ function stepOnce(
         w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride) + floorExtraTime; // 直搭載＝②（または個別処理速度）＋⑤搭載調整時間
         w.activeProcPt = w.procTimer;
         w.findTimer = findTime; // ①見つける（積み込み前の待ち）
-      } else if (w.floorQueue.length > 0) {
-        // アイドル中は閾値に関係なく床置きを処理
+      } else if (s.emergencyStop && w.floorQueue.length > 0) {
+        // 緊急停止中は解除に床の荷物の積み込み完了が必要なため、閾値に関係なく床置きを処理
         w.floorBatchActive = true;
         w.activeFloor = w.floorQueue.shift()!;
         w.activeFloor.timer = w.activeFloor.maxTimer;
@@ -4219,8 +4199,7 @@ export default function BaggageSimulation() {
             <div className="mt-3 pt-2 border-t border-gray-700 text-xs text-gray-500 space-y-1">
               <div>・カロリーPTに入るのは「積み込み時間」だけ（<CircledNum c="①" />・<CircledNum c="⑥" />は入らない）</div>
               <div>・便フィルタの個別処理速度を設定した便は、<CircledNum c="②" />をその秒数に置き換える</div>
-              <div>・床仮置き積極化時は、取った荷物を100%床に置く（床置き確率は使わない）</div>
-              <div>・積極化中は取った荷物を即時に床へ置くことに専念し、床の荷物が床仮置き上限（{floorMax}個）に達した作業者はベルトから取らずに床から積み込む（上限未満の間は床から積まない。閾値未満・緊急停止中は通常どおり床から積み込む）</div>
+              <div>・床仮置き積極化時は、取った荷物を100%即時に床へ置く（床置き確率は使わない）。床からの積み込みは通常どおりの優先順位で行い、床の荷物が床仮置き上限（{floorMax}個）に達した作業者はベルトから取らずに床から積み込む</div>
               <div>・<CircledNum c="②" /><CircledNum c="③" /><CircledNum c="④" />は作業者ごとに個別設定できる（この表は「作業時間（全員共通）」の値で計算）</div>
             </div>
           </div>
@@ -4258,9 +4237,9 @@ export default function BaggageSimulation() {
               </tbody>
             </table>
             <div className="mt-3 pt-2 border-t border-gray-700 text-xs text-gray-500 space-y-1">
-              <div>・床の荷物を積み込むタイミング: 直搭載の待ちがないとき／ベルト上が上限の半分（{unlimitedLaneCapacity ? '無制限' : `${(outerLaneCapacity + innerLaneCapacity) / 2}個`}）以下で床の荷物が床仮置き一括処理閾値（{floorBatchThreshold}個）以上のとき（まとめて処理）／全部の荷物を投入し終えてベルトが空のとき</div>
+              <div>・床の荷物を積み込むタイミング: 床の荷物が床仮置き一括処理閾値（{floorBatchThreshold}個）または床仮置き上限（{floorMax}個）の小さいほうに達し、直搭載の待ちがないとき（床が空になるまでまとめて処理。ベルト上の数は問わない）／緊急停止中（閾値に関係なく）／全部の荷物を投入し終えてベルトが空のとき。それまで床の荷物は溜めておき、手が空いたらベルトから荷物を取る</div>
               <div>・緊急停止で回収した荷物は、床置き確率と床仮置き上限に関係なく床に置く</div>
-              <div>・床仮置き積極化中（ベルト上{beltFloorTrigger}個以上）は、取った荷物を即時に床へ置くことに専念し、床の荷物が床仮置き上限（{floorMax}個）に達した作業者はベルトから取らずに床から積み込む（緊急停止中は通常どおり床から積み込む）</div>
+              <div>・床仮置き積極化中（ベルト上{beltFloorTrigger}個以上）は、床の荷物が床仮置き上限（{floorMax}個）に達した作業者はベルトから取らずに床から積み込む</div>
             </div>
           </div>
           </div>
