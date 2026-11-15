@@ -356,7 +356,19 @@ const DEST_NAMES = [
   'LJ606', 'SFJ707', 'ADO808', 'SKY909', 'APJ010',
 ];
 const DEFAULT_DEST_QTY = 200;
-const DEFAULT_FLOOR_EXTRA_TIME = 4;
+const DEFAULT_FLOOR_EXTRA_TIME = 0;
+// 作業時間の要素（秒/個）の初期値。①見つけるは積み込み前の待ち時間。積み込み時間は 直搭載＝②正味直搭載＋⑤搭載調整時間、
+// 床搭載＝②＋③付帯＋④シール＋⑤（緊急停止で回収した荷物はさらに＋⑦）。積み込み後に⑥移動/荷物探し時間
+const DEFAULT_FIND_TIME = 1;  // ①見つける（全員共通・全体設定。各積み込みの前に必要な時間）
+const DEFAULT_NET_TIME = 5;   // ②正味直搭載
+const DEFAULT_AUX_TIME = 5;   // ③付帯（床置き＋スキャン）。床搭載のみに加算
+const DEFAULT_SEAL_TIME = 2;  // ④シール。床搭載のみに加算
+// 作業時間の各要素スライダーの範囲（秒/個）
+const WORK_ELEM_MIN = 0;
+const WORK_ELEM_MAX = 10;
+const WORK_ELEM_STEP = 0.5;
+// ②正味直搭載の下限（0秒でも speed＝1/② が0除算にならないようにする）
+const MIN_DIRECT_PROC_SEC = 0.1;
 const DEFAULT_FLOOR_MAX = 10;
 
 // ── 再現可能な乱数（シード固定）────────────────────────────────
@@ -511,6 +523,8 @@ interface FloorBag {
   timer: number;
   maxTimer: number;
   destination: number;
+  // 腰痛リスクPT（暫定）用: この荷物の（②＋③）秒。床から搭載完了した時点で作業者の riskFloorSec に加算する
+  riskSec?: number;
 }
 
 interface Bag {
@@ -529,6 +543,14 @@ interface WorkerDef {
   id: number;
   pos: number;
   speed: number;
+  // ③付帯（床置き＋スキャン）・④シールの秒数。床搭載の積み込み時間にだけ加算する（②正味直搭載の秒数は 1/speed）
+  auxSec: number;
+  sealSec: number;
+  // ①見つける: 積み込み（直・床とも）を始める直前の待ち時間の残り秒数。0になるまで積み込みのタイマーを進めない
+  findTimer: number;
+  // 腰痛リスクPT（暫定の条件付き計算）用の累計秒数: 直搭載1個ごとに②、床搭載1個ごとに②＋③を加算
+  riskDirectSec: number;
+  riskFloorSec: number;
   queue: Bag[];
   current: Bag | null;
   procTimer: number;
@@ -570,6 +592,10 @@ interface HistPt {
   // 移動・荷物探しの待機秒数
   activeWorkerIds?: number[];
   travel?: number;
+  // 「5分ごとの処理能力」用: この時点の⑤搭載調整時間（直搭載の処理秒数に加算される）
+  extra?: number;
+  // 「5分ごとの処理能力」用: この時点の①見つける
+  find?: number;
 }
 
 interface SimState {
@@ -726,6 +752,8 @@ function makeState(
   flightEvents: FlightSpawnEvent[] | null = null,
   rngSeed: number = SIM_RNG_SEED,
   workerLayout: WorkerEdgeLayout | null = null,
+  workerAuxSecs: number[] = [],
+  workerSealSecs: number[] = [],
 ): SimState {
   const beltW = beltLongSide * PIXELS_PER_METER;
   const beltH = beltShortSide * PIXELS_PER_METER;
@@ -739,7 +767,8 @@ function makeState(
   const startHidden = !!flightEvents && flightEvents.length > 0;
 
   const workers: WorkerDef[] = workerPositions.map((pos, i) => ({
-    id: i, pos, speed: 1 / workerSpeeds[i],
+    id: i, pos, speed: 1 / workerSpeeds[i], auxSec: workerAuxSecs[i] ?? 0, sealSec: workerSealSecs[i] ?? 0,
+    findTimer: 0, riskDirectSec: 0, riskFloorSec: 0,
     queue: [], current: null, procTimer: 0,
     floorQueue: [], activeFloor: null, floorBatchActive: false, floorDoneCount: 0, doneCount: 0,
     workloadPt: 0, activeProcPt: 0,
@@ -937,6 +966,7 @@ function step(
   clockwise: boolean,
   injectionRuleId: string,
   speedOverride: SpeedOverride | null = null,
+  findTime: number = 0,
 ) {
   let remaining = dt;
   while (remaining > 1e-9) {
@@ -946,7 +976,7 @@ function step(
       pickupRate, pickupForceThreshold, outerLaneCapacity, innerLaneCapacity,
       floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger,
       workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId,
-      speedOverride,
+      speedOverride, findTime,
     );
     remaining -= sub;
   }
@@ -973,6 +1003,7 @@ function stepOnce(
   clockwise: boolean,
   injectionRuleId: string,
   speedOverride: SpeedOverride | null = null,
+  findTime: number = 0,
 ) {
   s.time += dt;
 
@@ -1001,23 +1032,19 @@ function stepOnce(
       s.nextSpawn = s.time;
       s.workers.forEach(w => { w.emergencyCollectTimer = 0; });
     } else {
-      // Each worker gradually collects inner lane belt bags to floor (1 bag per 1/w.speed seconds)
+      // 内側レーンの担当便の荷物を、作業者ごとに即時に床へ回収する（作業者番号順・ベルト上の並び順で、決定論的）。
+      // 回収した荷物の積み込み時間＝②正味直搭載＋③付帯＋④シール（②③④は回収した作業者の値）＋⑤搭載調整時間＋
+      // ⑦緊急停止床置き時間。⑦は積み込み時間にだけ使い、回収の間隔には使わない。
+      // 積み込み前に①見つける、積み込み後に⑥搭載後の移動/荷物探し時間が通常どおり入る
       for (const w of s.workers) {
-        const innerRemaining = s.bags.filter(b => b.state === 'belt' && b.lane === 0).length;
-        if (innerRemaining === 0) break;
-
-        const targetBag = s.bags.find(b => b.state === 'belt' && b.lane === 0 && w.assignedDests.includes(b.destination));
-        if (!targetBag) continue;
-
-        w.emergencyCollectTimer += dt;
-        const interval = emergencyCollectInterval > 0 ? emergencyCollectInterval : 0.001;
-        if (w.emergencyCollectTimer >= interval) {
-          w.emergencyCollectTimer -= interval;
+        for (const targetBag of s.bags) {
+          if (targetBag.state !== 'belt' || targetBag.lane !== 0 || !w.assignedDests.includes(targetBag.destination)) continue;
           recordPickByLap(s, targetBag);
           targetBag.state = 'floor';
           targetBag.workerId = w.id;
-          const ft = effectiveProcSeconds(w, targetBag.destination, speedOverride) + floorExtraTime;
-          w.floorQueue.push({ id: targetBag.id, color: targetBag.color, timer: ft, maxTimer: ft, destination: targetBag.destination });
+          const netSec = effectiveProcSeconds(w, targetBag.destination, speedOverride);
+          const ft = netSec + (w.auxSec ?? 0) + (w.sealSec ?? 0) + floorExtraTime + emergencyCollectInterval;
+          w.floorQueue.push({ id: targetBag.id, color: targetBag.color, timer: ft, maxTimer: ft, destination: targetBag.destination, riskSec: netSec + (w.auxSec ?? 0) });
           s.totalFloor++;
         }
       }
@@ -1155,8 +1182,9 @@ function stepOnce(
       recordPickByLap(s, bag);
       if (w.floorQueue.length + (w.activeFloor ? 1 : 0) < floorMax && (forceFloor || nextRandom(s) < floorDropProb)) {
         bag.state = 'floor'; bag.workerId = w.id;
-        const ft = effectiveProcSeconds(w, bag.destination, speedOverride) + floorExtraTime;
-        w.floorQueue.push({ id: bag.id, color: bag.color, timer: ft, maxTimer: ft, destination: bag.destination });
+        const netSec = effectiveProcSeconds(w, bag.destination, speedOverride);
+        const ft = netSec + (w.auxSec ?? 0) + (w.sealSec ?? 0) + floorExtraTime; // 床搭載＝②＋③＋④＋⑤
+        w.floorQueue.push({ id: bag.id, color: bag.color, timer: ft, maxTimer: ft, destination: bag.destination, riskSec: netSec + (w.auxSec ?? 0) });
         s.totalFloor++; break;
       } else {
         bag.state = 'queued'; bag.workerId = w.id; bag.pos = w.pos; w.queue.push(bag); break;
@@ -1171,11 +1199,16 @@ function stepOnce(
 
   for (const w of s.workers) {
     // 排他処理: 通常処理中は床仮置き処理不可、床仮置き処理中は通常処理不可
-    if (w.current) {
+    if (w.current && (w.findTimer ?? 0) > 0) {
+      // ①見つける（積み込み前の待ち）中 → 積み込みのタイマーはまだ進めない
+      w.findTimer = Math.max(0, w.findTimer - dt);
+    } else if (w.current) {
       // 通常処理中 → 床仮置きはタイマーを進めない
       w.procTimer -= dt;
       if (w.procTimer <= 0) {
         const finishedDest = w.current!.destination;
+        // 腰痛リスクPT（暫定）: 直搭載1個ごとに②（個別処理速度の便はその秒数）を加算
+        w.riskDirectSec = (w.riskDirectSec ?? 0) + effectiveProcSeconds(w, finishedDest, speedOverride);
         s.bags = s.bags.filter(x => x.id !== w.current!.id);
         w.workloadPt += w.activeProcPt;
         w.activeProcPt = 0;
@@ -1185,11 +1218,16 @@ function stepOnce(
         s.doneByDest[finishedDest]++;
         markDestFinished(s, finishedDest, destLimits);
       }
+    } else if (w.activeFloor && (w.findTimer ?? 0) > 0) {
+      // ①見つける（積み込み前の待ち）中 → 床からの積み込みのタイマーはまだ進めない
+      w.findTimer = Math.max(0, w.findTimer - dt);
     } else if (w.activeFloor) {
       // 床仮置き処理中 → 通常処理は開始しない
       w.activeFloor.timer -= dt;
       if (w.activeFloor.timer <= 0) {
         w.workloadPt += w.activeFloor.maxTimer;
+        // 腰痛リスクPT（暫定）: 床搭載1個ごとに②＋③を加算
+        w.riskFloorSec = (w.riskFloorSec ?? 0) + (w.activeFloor.riskSec ?? 0);
         w.floorDoneCount++; s.totalDone++;
         w.loadedByDest[w.activeFloor.destination] = (w.loadedByDest[w.activeFloor.destination] ?? 0) + 1;
         s.doneByDest[w.activeFloor.destination]++;
@@ -1207,13 +1245,15 @@ function stepOnce(
           // バッチ継続: 次の床仮置きを処理
           w.activeFloor = w.floorQueue.shift()!;
           w.activeFloor.timer = w.activeFloor.maxTimer;
+          w.findTimer = findTime; // ①見つける（積み込み前の待ち）
         } else {
           // バッチ完了: ベルトキューへ復帰
           w.floorBatchActive = false;
           if (w.queue.length > 0) {
             w.current = w.queue.shift()!;
-            w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride);
+            w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride) + floorExtraTime; // 直搭載＝②（または個別処理速度）＋⑤搭載調整時間
             w.activeProcPt = w.procTimer;
+            w.findTimer = findTime; // ①見つける（積み込み前の待ち）
           }
         }
       } else if (beltSparse && w.floorQueue.length >= floorBatchThreshold && w.queue.length === 0) {
@@ -1221,16 +1261,19 @@ function stepOnce(
         w.floorBatchActive = true;
         w.activeFloor = w.floorQueue.shift()!;
         w.activeFloor.timer = w.activeFloor.maxTimer;
+        w.findTimer = findTime; // ①見つける（積み込み前の待ち）
       } else if (w.queue.length > 0) {
         // 待ちキューを処理
         w.current = w.queue.shift()!;
-        w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride);
+        w.procTimer = effectiveProcSeconds(w, w.current.destination, speedOverride) + floorExtraTime; // 直搭載＝②（または個別処理速度）＋⑤搭載調整時間
         w.activeProcPt = w.procTimer;
+        w.findTimer = findTime; // ①見つける（積み込み前の待ち）
       } else if (w.floorQueue.length > 0) {
         // アイドル中は閾値に関係なく床置きを処理
         w.floorBatchActive = true;
         w.activeFloor = w.floorQueue.shift()!;
         w.activeFloor.timer = w.activeFloor.maxTimer;
+        w.findTimer = findTime; // ①見つける（積み込み前の待ち）
       }
       // 両方空の場合は待機
     }
@@ -1248,6 +1291,7 @@ function stepOnce(
           w.floorBatchActive = true;
           w.activeFloor = w.floorQueue.shift()!;
           w.activeFloor.timer = w.activeFloor.maxTimer;
+          w.findTimer = findTime; // ①見つける（積み込み前の待ち）
         }
       }
     }
@@ -1297,6 +1341,8 @@ function stepOnce(
         ? s.workers.reduce<number[]>((ids, w, wi) => { if (w.visible) ids.push(wi); return ids; }, [])
         : undefined,
       travel: workerTravelTime,
+      extra: floorExtraTime,
+      find: findTime,
     });
   }
 }
@@ -1342,14 +1388,14 @@ interface ChartDestFilter {
 // 「前回結果を重ねる」用: リセット直前の計算結果（グラフ用の履歴と、処理能力の計算に必要な作業者の情報）
 interface PrevChartData {
   hist: HistPt[];
-  workers: { speed: number; assignedDests: number[] }[];
+  workers: { speed: number; assignedDests: number[]; auxSec?: number; sealSec?: number }[];
 }
 
 // グラフに描く系列（便フィルタの絞り込み・処理能力・5分ごとの投入量）を履歴から組み立てる。
 // 今回の結果と「前回結果を重ねる」の前回の結果で同じ計算を使う
 function buildChartSeries(
   rawHist: HistPt[],
-  workers: { speed: number; assignedDests: number[] }[],
+  workers: { speed: number; assignedDests: number[]; auxSec?: number; sealSec?: number }[],
   destFilter: ChartDestFilter | null,
   speedOverrideSeconds: number | null,
 ) {
@@ -1368,11 +1414,13 @@ function buildChartSeries(
       })
     : rawHist;
 
-  // 「5分ごとの処理能力」: 各記録時点でベルトに配置（表示）されていた作業者ごとに 300秒÷（処理秒数＋移動待機秒数）を合計する
+  // 「5分ごとの処理能力」: 各記録時点でベルトに配置（表示）されていた作業者ごとに 300秒÷（①＋②＋③＋④＋⑤＋⑥）を合計する
   // （床置きの追加時間・ピック確率は含めない、直搭載のみの理論上限）。便フィルタ中は対象便を1つ以上担当する作業者だけで計算し、
   // 個別処理速度が設定されていればその秒数を使う
   const capacityPts = rawHist.map(hp => {
     const travel = hp.travel ?? 0;
+    const extra = hp.extra ?? 0;
+    const find = hp.find ?? 0;
     const ids = hp.activeWorkerIds ?? workers.map((_, wi) => wi);
     let cap = 0;
     for (const wi of ids) {
@@ -1380,7 +1428,8 @@ function buildChartSeries(
       if (!wk) continue;
       if (destFilter && !wk.assignedDests.some(d => destFilter.indices.includes(d))) continue;
       const procSec = destFilter && speedOverrideSeconds !== null ? speedOverrideSeconds : 1 / wk.speed;
-      const cycle = procSec + travel;
+      // 1個あたり＝①見つける＋②正味直搭載＋③付帯＋④シール＋⑤搭載調整時間＋⑥移動/荷物探し時間
+      const cycle = find + procSec + (wk.auxSec ?? 0) + (wk.sealSec ?? 0) + extra + travel;
       if (cycle > 0) cap += BUCKET_SEC / cycle;
     }
     return { t: hp.t, cap };
@@ -2734,12 +2783,24 @@ export default function BaggageSimulation() {
   const [caloriePtPerSec, setCaloriePtPerSec]   = useState(1);   // カロリーPT: 実作業1秒あたりのPT
   const [backRiskPtPerDrop, setBackRiskPtPerDrop] = useState(0.7); // 直搭載1個あたりの腰痛リスクPT（腰痛リスクPT＝直搭載個数×この値＋床搭載個数×床搭載腰痛リスク）
   const [floorBackRiskPt, setFloorBackRiskPt] = useState(1); // 床搭載1個あたりの腰痛リスクPT
-  const [workerSpeeds, setWorkerSpeeds]   = useState<number[]>(
-    new Array(MAX_WORKERS).fill(10)
+  // 作業時間の4要素（秒/個）。①見つけるは全員共通、②正味搭載・③付帯（床置き＋スキャン）・④シールは作業者ごと
+  const [findTime, setFindTime] = useState(DEFAULT_FIND_TIME);
+  const [workerNet, setWorkerNet]   = useState<number[]>(() => new Array(MAX_WORKERS).fill(DEFAULT_NET_TIME));
+  const [workerAux, setWorkerAux]   = useState<number[]>(() => new Array(MAX_WORKERS).fill(DEFAULT_AUX_TIME));
+  const [workerSeal, setWorkerSeal] = useState<number[]>(() => new Array(MAX_WORKERS).fill(DEFAULT_SEAL_TIME));
+  // 共通の②③④スライダー専用の表示値（動かすと全員のその要素を同じ値にする。個別に変えても連動して見えないよう独立させる）
+  const [commonNet, setCommonNet]   = useState(DEFAULT_NET_TIME);
+  const [commonAux, setCommonAux]   = useState(DEFAULT_AUX_TIME);
+  const [commonSeal, setCommonSeal] = useState(DEFAULT_SEAL_TIME);
+  // ②正味直搭載（秒/個）。シミュレーションでは speed＝1/この値。直搭載の積み込み時間＝②＋⑤、
+  // 床搭載＝②＋③＋④＋⑤（緊急停止で回収した荷物は＋⑦）。①見つけるは積み込み前の待ち時間として別に入る
+  const workerSpeeds = useMemo(
+    () => workerNet.map(net => Math.max(MIN_DIRECT_PROC_SEC, net)),
+    [workerNet],
   );
-  // 「一括処理時間調整」バー専用の表示値。workerSpeeds[0]（作業1の値）を見て表示すると、
-  // 作業1バーを個別に動かした時にも一括バーが連動して見えてしまうため、独立させている。
-  const [batchSpeedAdjust, setBatchSpeedAdjust] = useState(10);
+  // 「一括処理時間調整」バー専用の表示値（＝合計作業時間〔②＋③＋④〕の一括設定値）。
+  // 作業1バーを個別に動かした時にも一括バーが連動して見えてしまわないよう、独立させている。
+  const [batchSpeedAdjust, setBatchSpeedAdjust] = useState(DEFAULT_NET_TIME + DEFAULT_AUX_TIME + DEFAULT_SEAL_TIME);
   const [floorDropProb, setFloorDropProb]         = useState(0.3);
   const [pickupRate, setPickupRate]               = useState(0.5);
   const [pickupForceThreshold, setPickupForceThreshold] = useState(50);
@@ -2903,6 +2964,7 @@ export default function BaggageSimulation() {
   const [snapshotCount, setSnapshotCount]   = useState(0);
   const [stats, setStats] = useState<{
     id: number; q: number; floor: number; done: number; floorDone: number; workloadPt: number;
+    riskDirectSec: number; riskFloorSec: number;
     loadDuration: { sec: number; loading: boolean } | null;
   }[]>([]);
   const [overlayStats, setOverlayStats] = useState<{ time: number; spawned: number; belt: number; done: number; floor: number; totalFloor: number; overflow: number; firstOuterExceedTime: number | null; firstOverflowTime: number | null; emergencyStopCount: number; emergencyStopTotalTime: number; flightsOnBelt: number; totalFlights: number }>({ time: 0, spawned: 0, belt: 0, done: 0, floor: 0, totalFloor: 0, overflow: 0, firstOuterExceedTime: null, firstOverflowTime: null, emergencyStopCount: 0, emergencyStopTotalTime: 0, flightsOnBelt: 0, totalFlights: 0 });
@@ -2970,7 +3032,7 @@ export default function BaggageSimulation() {
     if (prevState && prevState.hist.length >= 2) {
       prevChartRef.current = {
         hist: prevState.hist,
-        workers: prevState.workers.map(w => ({ speed: w.speed, assignedDests: [...w.assignedDests] })),
+        workers: prevState.workers.map(w => ({ speed: w.speed, assignedDests: [...w.assignedDests], auxSec: w.auxSec, sealSec: w.sealSec })),
       };
       setHasPrevChart(true);
     }
@@ -2991,12 +3053,14 @@ export default function BaggageSimulation() {
       excelFlightEventsRef.current,
       activeSeedRef.current,
       workerLayout,
+      workerAux.slice(0, workerCount),
+      workerSeal.slice(0, workerCount),
     );
     lastTsRef.current = 0;
     maxBeltSnapshotRef.current = { count: -1, snapshot: null };
     setHasPeakCapture(false);
     setSimInitVersion(v => v + 1);
-  }, [workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, rngMode]);
+  }, [workerCount, workerSpeeds, workerAux, workerSeal, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, rngMode]);
 
   useEffect(() => { initSim(); }, [initSim]);
 
@@ -3014,11 +3078,13 @@ export default function BaggageSimulation() {
       if (runningRef.current) {
         s.workers.forEach((w, i) => {
           w.speed = 1 / (workerSpeeds[i] ?? 10);
+          w.auxSec = workerAux[i] ?? 0;
+          w.sealSec = workerSeal[i] ?? 0;
           w.assignedDests = workerDests[i] ?? [];
         });
         const perimMeters = s.beltPerim / PIXELS_PER_METER;
         const circuitsPerSec = beltSpeedMS / perimMeters;
-        step(s, wallDt * simSpeed, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities, pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride);
+        step(s, wallDt * simSpeed, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities, pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride, findTime);
         updateMaxBeltSnapshot(s, maxBeltSnapshotRef);
         if (maxBeltSnapshotRef.current.snapshot) setHasPeakCapture(true);
 
@@ -3076,6 +3142,8 @@ export default function BaggageSimulation() {
           done: w.doneCount,
           floorDone: w.floorDoneCount,
           workloadPt: w.workloadPt,
+          riskDirectSec: w.riskDirectSec ?? 0,
+          riskFloorSec: w.riskFloorSec ?? 0,
           loadDuration: workerLoadDuration(displayState, w, destQuantitiesRef.current),
         })));
       }
@@ -3099,7 +3167,7 @@ export default function BaggageSimulation() {
     };
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
-  }, [syncDestColorsUi, arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId, chartSeriesVisible, chartDestFilter, speedOverride, nominalLaneCapacityTotal, showPrevChart]);
+  }, [syncDestColorsUi, arrivalInterval, beltSpeedMS, simSpeed, workerCount, workerSpeeds, workerAux, workerSeal, findTime, floorDropProb, workerDests, destQuantities, pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth, clockwise, injectionRuleId, chartSeriesVisible, chartDestFilter, speedOverride, nominalLaneCapacityTotal, showPrevChart]);
 
   const toggleRunning = () => {
     if (!runningRef.current && scrubIndexRef.current !== null) {
@@ -3150,6 +3218,8 @@ export default function BaggageSimulation() {
       excelFlightEventsRef.current,
       activeSeedRef.current,
       workerLayout,
+      workerAux.slice(0, workerCount),
+      workerSeal.slice(0, workerCount),
     );
     stateRef.current = s;
 
@@ -3161,10 +3231,12 @@ export default function BaggageSimulation() {
     for (let i = 0; i < MAX_ITER; i++) {
       s.workers.forEach((w, wi) => {
         w.speed = 1 / (workerSpeeds[wi] ?? 10);
+        w.auxSec = workerAux[wi] ?? 0;
+        w.sealSec = workerSeal[wi] ?? 0;
         w.assignedDests = workerDests[wi] ?? [];
       });
       step(s, dt, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities,
-           pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride);
+           pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride, findTime);
       updateMaxBeltSnapshot(s, maxBeltSnapshotRef);
 
       // 0-5分は30秒刻み、5分以降は300秒刻みでスナップショット保存
@@ -3204,6 +3276,8 @@ export default function BaggageSimulation() {
       done: w.doneCount,
       floorDone: w.floorDoneCount,
       workloadPt: w.workloadPt,
+          riskDirectSec: w.riskDirectSec ?? 0,
+          riskFloorSec: w.riskFloorSec ?? 0,
       loadDuration: workerLoadDuration(snap, w, destQuantitiesRef.current),
     })));
     setOverlayStats({
@@ -3221,7 +3295,7 @@ export default function BaggageSimulation() {
       flightsOnBelt: new Set(snap.bags.filter(b => b.state === 'belt').map(b => b.destination)).size,
       totalFlights: new Set(snap.workers.flatMap(w => w.assignedDests)).size,
     });
-  }, [syncDestColorsUi, workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
+  }, [syncDestColorsUi, workerCount, workerSpeeds, workerAux, workerSeal, findTime, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
       beltSpeedMS, arrivalInterval, floorDropProb, destQuantities, pickupRate, pickupForceThreshold,
       effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride]);
 
@@ -3246,6 +3320,8 @@ export default function BaggageSimulation() {
         excelFlightEventsRef.current,
         activeSeedRef.current,
         workerLayout,
+        workerAux.slice(0, workerCount),
+        workerSeal.slice(0, workerCount),
       );
       const circuitsPerSec = beltSpeedMS / (s.beltPerim / PIXELS_PER_METER);
       const dt = 2.0; // runToCompletion と同じ（内部で0.1秒刻みに分割される）
@@ -3253,10 +3329,12 @@ export default function BaggageSimulation() {
       for (let i = 0; i < MAX_ITER; i++) {
         s.workers.forEach((w, wi) => {
           w.speed = 1 / (workerSpeeds[wi] ?? 10);
+          w.auxSec = workerAux[wi] ?? 0;
+          w.sealSec = workerSeal[wi] ?? 0;
           w.assignedDests = workerDests[wi] ?? [];
         });
         step(s, dt, arrivalInterval, circuitsPerSec, floorDropProb, destQuantities,
-             pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride);
+             pickupRate, pickupForceThreshold, effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride, findTime);
         const aSet = new Set(s.workers.flatMap(w => w.assignedDests));
         const tLimit = destQuantities.reduce((a, b, idx2) => aSet.has(idx2) ? a + b : a, 0);
         const tSpawn = s.spawnedByDest.reduce((a, b, idx2) => aSet.has(idx2) ? a + b : a, 0);
@@ -3267,7 +3345,7 @@ export default function BaggageSimulation() {
       plannedMaxWorkersRef.current = s.maxActiveWorkers ?? 0;
     }, 300);
     return () => clearTimeout(timer);
-  }, [simInitVersion, excelFileName, workerCount, workerSpeeds, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
+  }, [simInitVersion, excelFileName, workerCount, workerSpeeds, workerAux, workerSeal, findTime, workerDests, beltLongSide, beltShortSide, bagLength, bagWidth, beltWidth,
       beltSpeedMS, arrivalInterval, floorDropProb, destQuantities, pickupRate, pickupForceThreshold,
       effOuterLaneCapacity, effInnerLaneCapacity, floorExtraTime, floorMax, floorBatchThreshold, beltFloorTrigger, workerTravelTime, emergencyMargin, emergencyCollectInterval, clockwise, injectionRuleId, speedOverride]);
 
@@ -3281,11 +3359,23 @@ export default function BaggageSimulation() {
     }, 0);
   }, [runToCompletion]);
 
-  const updateWorkerSpeed = (i: number, v: number) => {
-    setWorkerSpeeds(prev => { const next = [...prev]; next[i] = v; return next; });
+  // 作業者ごとの②③④を1つ変更する
+  const updateWorkerElem = (kind: 'net' | 'aux' | 'seal', i: number, v: number) => {
+    const setter = kind === 'net' ? setWorkerNet : kind === 'aux' ? setWorkerAux : setWorkerSeal;
+    setter(prev => { const next = [...prev]; next[i] = v; return next; });
   };
+  // 共通の②③④スライダー: 全員のその要素を同じ値にする
+  const updateCommonElem = (kind: 'net' | 'aux' | 'seal', v: number) => {
+    if (kind === 'net') { setWorkerNet(new Array(MAX_WORKERS).fill(v)); setCommonNet(v); }
+    else if (kind === 'aux') { setWorkerAux(new Array(MAX_WORKERS).fill(v)); setCommonAux(v); }
+    else { setWorkerSeal(new Array(MAX_WORKERS).fill(v)); setCommonSeal(v); }
+  };
+  // 一括処理時間調整: 全員の合計作業時間（②＋③＋④）がこの値になるよう、②正味搭載だけを調整する
+  // （②が0〜10秒に収まらない場合は範囲の端で止めるため、合計がこの値にならないことがある）
+  const clampWorkElem = (v: number) => Math.min(WORK_ELEM_MAX, Math.max(WORK_ELEM_MIN, v));
   const updateAllWorkerSpeeds = (v: number) => {
-    setWorkerSpeeds(new Array(MAX_WORKERS).fill(v));
+    setWorkerNet(prev => prev.map((_, i) => clampWorkElem(v - (workerAux[i] ?? DEFAULT_AUX_TIME) - (workerSeal[i] ?? DEFAULT_SEAL_TIME))));
+    setCommonNet(clampWorkElem(v - commonAux - commonSeal));
     setBatchSpeedAdjust(v);
   };
   const toggleDest = (wi: number, di: number) => {
@@ -3788,8 +3878,9 @@ export default function BaggageSimulation() {
         </div>
       </div>
 
-      {/* 全体設定・作業者別処理速度の2枠は画面幅の3分の2に収め、右の3分の1は今後の別項目用に空けておく */}
-      <div className="flex gap-4">
+      {/* 全体設定・作業者別処理速度の2枠は画面幅の3分の2に収め、右の3分の1に積み込み時間のロジック表を置く
+          （狭い画面で横に並ばないときは表が下に回り込む） */}
+      <div className="flex gap-4 flex-wrap">
       <div className="w-2/3 flex gap-4 flex-wrap">
 
         {/* 全体設定 */}
@@ -3883,8 +3974,9 @@ export default function BaggageSimulation() {
           <Slider label={`ピックアップ率: ${(pickupRate * 100).toFixed(0)}%`} min={0}   max={1}    step={0.05}  value={pickupRate}     onChange={setPickupRate} />
           <Slider label={`100％ピックアップ荷物数（ベルト上）: ${pickupForceThreshold} 個以下`} min={10} max={100} step={5} value={pickupForceThreshold} onChange={setPickupForceThreshold} />
           <Slider label={`床置き確率: ${(floorDropProb * 100).toFixed(0)}%`} min={0}    max={1}    step={0.05}  value={floorDropProb}  onChange={setFloorDropProb} />
-          <Slider label={`搭載後の移動/荷物探し時間: +${workerTravelTime} 秒/個`} min={0} max={10} step={0.5} value={workerTravelTime} onChange={setWorkerTravelTime} />
-          <Slider label={`床置き追加時間: +${floorExtraTime} 秒（通常の処理時間に上乗せ）`}           min={0}    max={30}   step={1}     value={floorExtraTime} onChange={setFloorExtraTime} />
+          <Slider label={`①見つける: ${findTime} 秒/個（全作業者共通・各積み込みの前に必要な時間）`} min={WORK_ELEM_MIN} max={WORK_ELEM_MAX} step={WORK_ELEM_STEP} value={findTime} onChange={setFindTime} />
+          <Slider label={`⑥搭載後の移動/荷物探し時間: +${workerTravelTime} 秒/個`} min={0} max={10} step={0.5} value={workerTravelTime} onChange={setWorkerTravelTime} />
+          <Slider label={`⑤搭載調整時間：+${floorExtraTime}秒/個（通常の作業時間に上乗せ）`}           min={0}    max={30}   step={1}     value={floorExtraTime} onChange={setFloorExtraTime} />
           <Slider label={`床仮置き上限: ${floorMax} 個`}                    min={1}    max={20}   step={1}     value={floorMax}       onChange={setFloorMax} />
           <Slider label={`床仮置き一括処理閾値: ${floorBatchThreshold} 個`} min={1}    max={20}   step={1}     value={floorBatchThreshold} onChange={setFloorBatchThreshold} />
           <Slider label={`床仮置き積極化 ベルト数閾値: ${beltFloorTrigger} 個`} min={10} max={200} step={5} value={beltFloorTrigger} onChange={setBeltFloorTrigger} />
@@ -3931,7 +4023,7 @@ export default function BaggageSimulation() {
             label={unlimitedLaneCapacity ? '緊急停止荷物数（ベルト上）: ∞ - ' + emergencyMargin + ' 個' : `緊急停止荷物数（ベルト上）: ${outerLaneCapacity + innerLaneCapacity}個 - ${emergencyMargin} 個`}
             min={0} max={50} step={5} value={emergencyMargin} onChange={setEmergencyMargin}
           />
-          <Slider label={`緊急停止床置き時間: ${emergencyCollectInterval} 秒/個`} min={0}   max={10}   step={0.5}   value={emergencyCollectInterval} onChange={setEmergencyCollectInterval} />
+          <Slider label={`⑦緊急停止床置き時間: ${emergencyCollectInterval} 秒/個`} min={0}   max={10}   step={0.5}   value={emergencyCollectInterval} onChange={setEmergencyCollectInterval} />
         </div>
 
         {/* 作業者別設定 */}
@@ -3947,11 +4039,18 @@ export default function BaggageSimulation() {
           </div>
           <div className="pb-2 border-b border-gray-700">
             <Slider
-              label={`一括処理時間調整: ${batchSpeedAdjust} 秒/個`}
+              label={`一括処理時間調整（合計作業時間＝②＋③＋④）: ${batchSpeedAdjust} 秒/個`}
               min={5} max={15} step={1}
               value={batchSpeedAdjust}
               onChange={updateAllWorkerSpeeds}
             />
+          </div>
+          {/* 作業時間（全員共通）: 動かすと全員のその要素を同じ値にする（①見つけるは全体設定） */}
+          <div className="pb-2 border-b border-gray-700">
+            <div className="text-xs text-gray-400 mb-1">作業時間（全員共通）</div>
+            <Slider label={`②正味直搭載: ${commonNet} 秒/個`} min={WORK_ELEM_MIN} max={WORK_ELEM_MAX} step={WORK_ELEM_STEP} value={commonNet} onChange={v => updateCommonElem('net', v)} />
+            <Slider label={`③付帯（床置き＋スキャン）: ${commonAux} 秒/個（床搭載のみ）`} min={WORK_ELEM_MIN} max={WORK_ELEM_MAX} step={WORK_ELEM_STEP} value={commonAux} onChange={v => updateCommonElem('aux', v)} />
+            <Slider label={`④シール: ${commonSeal} 秒/個（床搭載のみ）`} min={WORK_ELEM_MIN} max={WORK_ELEM_MAX} step={WORK_ELEM_STEP} value={commonSeal} onChange={v => updateCommonElem('seal', v)} />
           </div>
           <div className="pb-2 border-b border-gray-700">
             <Slider
@@ -3962,13 +4061,13 @@ export default function BaggageSimulation() {
             />
             <div className="grid grid-cols-2 gap-3">
               <Slider
-                label={`直搭載腰痛リスク: ${backRiskPtPerDrop.toFixed(1)} PT/回`}
+                label={`直搭載腰痛リスク（暫定）: ${backRiskPtPerDrop.toFixed(1)} PT/秒（×②）`}
                 min={0} max={10} step={0.1}
                 value={backRiskPtPerDrop}
                 onChange={setBackRiskPtPerDrop}
               />
               <Slider
-                label={`床搭載腰痛リスク: ${floorBackRiskPt.toFixed(1)} PT/回`}
+                label={`床搭載腰痛リスク（暫定）: ${floorBackRiskPt.toFixed(1)} PT/秒（×②＋③）`}
                 min={0} max={10} step={0.1}
                 value={floorBackRiskPt}
                 onChange={setFloorBackRiskPt}
@@ -3987,24 +4086,31 @@ export default function BaggageSimulation() {
             const directRatePct = loadedTotal > 0 ? `${Math.round((directDone / loadedTotal) * 100)}` : '—';
             return (
               <div key={i}>
-                <Slider
-                  label={`作業${i + 1}: ${workerSpeeds[i] ?? 10} 秒/個　担当: ${
+                <div className="text-xs text-gray-300 mb-1">
+                  作業{i + 1}　担当: {
                     // 担当便名とその便の予定投入数（行先便別投入数設定／エクセル読込の値）を並べて表示
                     (workerDests[i] ?? []).length > 0
                       ? (workerDests[i] ?? []).map(d => `${flightNames[d]}（${destQuantities[d] ?? 0}個）`).join(' / ')
                       : 'なし'
-                  }`}
-                  min={5} max={15} step={1}
-                  value={workerSpeeds[i] ?? 10}
-                  onChange={(v) => updateWorkerSpeed(i, v)}
-                />
+                  }
+                </div>
+                {/* 作業者ごとの②③④（共通スライダーを動かすまで個別の値を保つ） */}
+                <div className="grid grid-cols-3 gap-2">
+                  <Slider label={`②正味直搭載 ${workerNet[i] ?? DEFAULT_NET_TIME}秒`} min={WORK_ELEM_MIN} max={WORK_ELEM_MAX} step={WORK_ELEM_STEP} value={workerNet[i] ?? DEFAULT_NET_TIME} onChange={v => updateWorkerElem('net', i, v)} />
+                  <Slider label={`③付帯 ${workerAux[i] ?? DEFAULT_AUX_TIME}秒`} min={WORK_ELEM_MIN} max={WORK_ELEM_MAX} step={WORK_ELEM_STEP} value={workerAux[i] ?? DEFAULT_AUX_TIME} onChange={v => updateWorkerElem('aux', i, v)} />
+                  <Slider label={`④シール ${workerSeal[i] ?? DEFAULT_SEAL_TIME}秒`} min={WORK_ELEM_MIN} max={WORK_ELEM_MAX} step={WORK_ELEM_STEP} value={workerSeal[i] ?? DEFAULT_SEAL_TIME} onChange={v => updateWorkerElem('seal', i, v)} />
+                </div>
+                {/* 合計作業時間＝②＋③＋④ */}
+                <div className="text-xs text-emerald-300 ml-2 mt-1">
+                  合計作業時間：{(workerNet[i] ?? DEFAULT_NET_TIME) + (workerAux[i] ?? DEFAULT_AUX_TIME) + (workerSeal[i] ?? DEFAULT_SEAL_TIME)}秒/個（＝②＋③＋④）
+                </div>
                 <div className={`text-xs ${col} ml-2 mt-1`}>
                   待ち: {q}個 / 処理済: {loadedTotal}個 / 直搭載: {directDone}個 / 床搭載: {floorDoneN}個
                 </div>
                 <div className="text-xs ml-2 mt-1">
                   <span className="text-amber-300">{Math.round((st?.workloadPt ?? 0) * caloriePtPerSec)} カロリーPT</span>
                   <span className="text-gray-500"> / </span>
-                  <span className="text-rose-300">{Math.round(directDone * backRiskPtPerDrop + floorDoneN * floorBackRiskPt)} 腰痛リスクPT（＝直＋床）</span>
+                  <span className="text-rose-300">{Math.round((st?.riskDirectSec ?? 0) * backRiskPtPerDrop + (st?.riskFloorSec ?? 0) * floorBackRiskPt)} 腰痛リスクPT（＝直＋床）</span>
                 </div>
                 <div className="text-xs text-gray-300 ml-2 mt-1">
                   床搭載率 {floorRatePct}% / 直搭載率 {directRatePct}%
@@ -4019,6 +4125,62 @@ export default function BaggageSimulation() {
         </div>
 
       </div>
+
+      {/* 荷物の積み込みにかかる時間（ケース別）: ①〜⑦の組み合わせと、現在の設定での秒数（②③④は全員共通の値）。表示専用 */}
+      {(() => {
+        const t1 = findTime, t2 = commonNet, t3 = commonAux, t4 = commonSeal;
+        const t5 = floorExtraTime, t6 = workerTravelTime, t7 = emergencyCollectInterval;
+        const fmt = (v: number) => `${Math.round(v * 10) / 10}秒`;
+        const rows: { name: string; load: string[]; loadSec: number }[] = [
+          { name: '直搭載', load: ['②', '⑤'], loadSec: t2 + t5 },
+          { name: '床搭載', load: ['②', '③', '④', '⑤'], loadSec: t2 + t3 + t4 + t5 },
+          { name: '緊急停止時の床搭載', load: ['②', '③', '④', '⑤', '⑦'], loadSec: t2 + t3 + t4 + t5 + t7 },
+        ];
+        const legend: [string, string, number][] = [
+          ['①', '見つける', t1], ['②', '正味直搭載', t2], ['③', '付帯（床置き＋スキャン）', t3], ['④', 'シール', t4],
+          ['⑤', '搭載調整時間', t5], ['⑥', '搭載後の移動/荷物探し時間', t6], ['⑦', '緊急停止床置き時間', t7],
+        ];
+        const formula = (marks: string[]) => marks.map((m, k) => (
+          <span key={k}>{k > 0 && '＋'}<CircledNum c={m} /></span>
+        ));
+        return (
+          <div className="flex-1 min-w-60 bg-gray-900 rounded-lg p-4 border border-gray-700 self-start">
+            <div className="text-xs font-semibold text-gray-400 mb-3 uppercase tracking-wide">荷物の積み込みにかかる時間（ケース別）</div>
+            <table className="w-full text-xs text-gray-300 border-collapse">
+              <thead>
+                <tr className="text-gray-400 border-b border-gray-700">
+                  <th className="text-left font-medium py-1 pr-2">ケース</th>
+                  <th className="text-left font-medium py-1 pr-2">積み込み前</th>
+                  <th className="text-left font-medium py-1 pr-2">積み込み時間</th>
+                  <th className="text-left font-medium py-1 pr-2">積み込み後</th>
+                  <th className="text-right font-medium py-1">1個あたり合計</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(r => (
+                  <tr key={r.name} className="border-b border-gray-800 align-middle">
+                    <td className="py-1.5 pr-2 text-gray-200">{r.name}</td>
+                    <td className="py-1.5 pr-2 whitespace-nowrap"><CircledNum c="①" /> {fmt(t1)}</td>
+                    <td className="py-1.5 pr-2">{formula(r.load)} <span className="whitespace-nowrap">{fmt(r.loadSec)}</span></td>
+                    <td className="py-1.5 pr-2 whitespace-nowrap"><CircledNum c="⑥" /> {fmt(t6)}</td>
+                    <td className="py-1.5 text-right text-emerald-300 whitespace-nowrap">{fmt(t1 + r.loadSec + t6)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="mt-3 grid grid-cols-1 gap-0.5 text-xs text-gray-400">
+              {legend.map(([m, label, v]) => (
+                <div key={m}><CircledNum c={m} /> {label}: {fmt(v)}</div>
+              ))}
+            </div>
+            <div className="mt-3 pt-2 border-t border-gray-700 text-xs text-gray-500 space-y-1">
+              <div>・カロリーPTに入るのは「積み込み時間」だけ（<CircledNum c="①" />・<CircledNum c="⑥" />は入らない）</div>
+              <div>・便フィルタの個別処理速度を設定した便は、<CircledNum c="②" />をその秒数に置き換える</div>
+              <div>・<CircledNum c="②" /><CircledNum c="③" /><CircledNum c="④" />は作業者ごとに個別設定できる（この表は「作業時間（全員共通）」の値で計算）</div>
+            </div>
+          </div>
+        );
+      })()}
       </div>
 
       {/* 行先便別投入数設定 */}
@@ -4098,6 +4260,11 @@ export default function BaggageSimulation() {
 }
 
 // ── Reusable slider ──────────────────────────────────────────
+// 積み込み時間の表で①〜⑦の記号だけを周りの文字（12px）の1.5倍の18pxで表示する
+function CircledNum({ c }: { c: string }) {
+  return <span style={{ fontSize: '18px', lineHeight: 1, verticalAlign: 'middle' }}>{c}</span>;
+}
+
 function Slider({ label, min, max, step, value, onChange, disabled }: {
   label: string; min: number; max: number; step: number;
   value: number; onChange: (v: number) => void; disabled?: boolean;
